@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── kalshi-arb-engine ─────────────────────────────────────────────────────────
+# Credentials and generated data. .env and .venv are covered above; these are
+# the ones the stock Python template misses.
+*.pem
+*.key
+kalshi_key*
+.env.local
+
+# SQLite databases and CSV output produced by the scan loop
+*.db
+*.db-journal
+*.csv

@@ -8,7 +8,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 
-from arbengine import alerts, storage
+from arbengine import alerts, backtest as bt, storage
 from arbengine.config import Settings
 from arbengine.models import opportunity_key
 from arbengine.paper import PaperBroker, summarize
@@ -216,6 +216,52 @@ async def _run_stream(settings: Settings, duration_sec: float | None) -> None:
             await conn.close()
 
 
+async def _run_backtest(settings: Settings) -> None:
+    """
+    Prove the detect -> fill -> settle path on real market geometry by
+    perturbing live quotes until coherence breaks.
+
+    Until a genuine opportunity appears, this is the only thing standing
+    between "the code compiles" and "the code works when it matters".
+    """
+    key = load_private_key(settings.kalshi_private_key_path)
+    async with KalshiClient(
+        settings.kalshi_base_url, settings.kalshi_ws_url,
+        settings.kalshi_api_key_id, key,
+    ) as client:
+        groups = await build_groups(client, settings)
+
+    if not groups:
+        log.error("No validated groups to backtest.")
+        return
+
+    print(f"\nInjecting synthetic dislocations into {len(groups)} live groups\n")
+    all_results = []
+    for g in groups:
+        results = bt.backtest_group(g, settings)
+        if not results:
+            continue
+        print(f"{g.group_id}  ({g.shape}, {len(g.contracts)} legs, "
+              f"fee_scale={g.fee_scale:g})")
+        for r in results:
+            print(r)
+            for note in r.notes:
+                print(f"      ! {note}")
+        all_results.extend(results)
+
+    s = bt.summarize(all_results)
+    print("\n" + "─" * 70)
+    print(
+        f"  {s['scenarios']} scenarios: {s['passed']} verified riskless, "
+        f"{s['failed']} fired but NOT riskless, {s['missed']} never fired"
+    )
+    if s["failed"]:
+        print("\n  FAILURES — a portfolio that loses in some state is not arbitrage:")
+        for r in s["failures"]:
+            print(f"    {r.group_id} / {r.scenario}: worst=${r.worst_pnl:+.4f}")
+    print("─" * 70 + "\n")
+
+
 def _make_broker(settings: Settings) -> PaperBroker | None:
     if not settings.paper_enabled:
         return None
@@ -358,10 +404,11 @@ def run() -> None:
     )
     parser.add_argument(
         "command", nargs="?", default="scan",
-        choices=["scan", "stream", "discover"],
+        choices=["scan", "stream", "discover", "backtest"],
         help=(
             "scan: REST polling loop. stream: event-driven WebSocket scan. "
-            "discover: list candidate series."
+            "discover: list candidate series. backtest: inject synthetic "
+            "dislocations into live groups and verify the lock end to end."
         ),
     )
     parser.add_argument(
@@ -385,6 +432,8 @@ def run() -> None:
             asyncio.run(_discover(settings))
         elif args.command == "stream":
             asyncio.run(_run_stream(settings, args.duration))
+        elif args.command == "backtest":
+            asyncio.run(_run_backtest(settings))
         else:
             asyncio.run(_run_scan(settings, args.once, args.iterations))
     except KeyboardInterrupt:

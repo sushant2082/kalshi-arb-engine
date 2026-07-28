@@ -2,7 +2,10 @@
 Scan loop: pull books, build groups, run detectors, dedupe, track persistence.
 """
 
+import asyncio
+import contextlib
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from arbengine.config import Settings
@@ -244,6 +247,90 @@ async def refresh_group(
             "fetched_at": now,
         }))
     return group.model_copy(update={"contracts": updated})
+
+
+def apply_quote(
+    group: ContractGroup, ticker: str, book: dict, ts: datetime
+) -> ContractGroup:
+    """Return the group with one leg's quote replaced. Cheap enough per tick."""
+    updated = []
+    for c in group.contracts:
+        if c.ticker != ticker:
+            updated.append(c)
+            continue
+        updated.append(c.model_copy(update={
+            "bid": book["bid"],
+            "ask": book["ask"],
+            "bid_size": book["bid_size"],
+            "ask_size": book["ask_size"],
+            "fetched_at": ts,
+        }))
+    return group.model_copy(update={"contracts": updated})
+
+
+async def stream_scan(
+    client: KalshiClient,
+    groups: list[ContractGroup],
+    settings: Settings,
+    on_opportunity,
+    stop_after_sec: float | None = None,
+) -> dict:
+    """
+    Event-driven scan: re-check a group the instant any of its legs moves.
+
+    REST polling at N seconds cannot see a violation that lives for less than N
+    seconds, and the fee arithmetic says the only violations that survive fees
+    are the fast ones. So the poll loop measures persistence honestly but
+    systematically undercounts opportunities; this path is what makes the count
+    meaningful.
+
+    Groups are re-scanned per update rather than on a timer because a lock
+    exists only while every leg holds its quote — batching updates would report
+    portfolios assembled from quotes that never coexisted.
+    """
+    ticker_to_groups: dict[str, list[int]] = {}
+    for idx, g in enumerate(groups):
+        for t in g.tickers:
+            ticker_to_groups.setdefault(t, []).append(idx)
+
+    tickers = sorted(ticker_to_groups)
+    queue: asyncio.Queue = asyncio.Queue()
+    live = list(groups)
+
+    producer = asyncio.create_task(client.stream_books(tickers, queue))
+    started = time.monotonic()
+    stats = {"updates": 0, "scans": 0, "opportunities": 0}
+
+    try:
+        while True:
+            if stop_after_sec is not None:
+                remaining = stop_after_sec - (time.monotonic() - started)
+                if remaining <= 0:
+                    break
+                try:
+                    ticker, book, ts = await asyncio.wait_for(
+                        queue.get(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    break
+            else:
+                ticker, book, ts = await queue.get()
+
+            stats["updates"] += 1
+
+            for idx in ticker_to_groups.get(ticker, ()):
+                live[idx] = apply_quote(live[idx], ticker, book, ts)
+                found = scan_group(live[idx], settings, ts)
+                stats["scans"] += 1
+                for opp in found:
+                    stats["opportunities"] += 1
+                    await on_opportunity(opp, live[idx])
+    finally:
+        producer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await producer
+
+    return stats
 
 
 def near_miss(group: ContractGroup, settings: Settings) -> dict:

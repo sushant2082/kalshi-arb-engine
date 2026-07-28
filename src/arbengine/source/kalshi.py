@@ -11,11 +11,13 @@ import asyncio
 import base64
 import json
 import logging
+import ssl
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import certifi
 import httpx
 import websockets
 import websockets.exceptions
@@ -124,6 +126,37 @@ def parse_book(data: dict) -> dict:
     ask_size = int(best_no_bid[1]) if best_no_bid else 0
 
     return {"bid": bid, "ask": ask, "bid_size": bid_size, "ask_size": ask_size}
+
+
+def _levels_from_snapshot(levels: list | None) -> dict[float, float]:
+    """Snapshot side -> {price: size}. Entries are ["0.0010", "26000.00"]."""
+    out: dict[float, float] = {}
+    for entry in levels or []:
+        if len(entry) < 2:
+            continue
+        price, size = _num(entry[0]), _num(entry[1])
+        if price is None or size is None or size <= 0:
+            continue
+        out[price] = size
+    return out
+
+
+def _book_from_levels(sides: dict[str, dict[float, float]]) -> dict:
+    """
+    Collapse maintained WS book state to the same YES-side top-of-book shape
+    the REST paths produce, so detectors never learn which feed they came from.
+    """
+    yes, no = sides.get("yes") or {}, sides.get("no") or {}
+
+    best_yes = max(yes) if yes else None
+    best_no = max(no) if no else None
+
+    return {
+        "bid": best_yes,
+        "bid_size": int(yes[best_yes]) if best_yes is not None else 0,
+        "ask": round(1.0 - best_no, 4) if best_no is not None else None,
+        "ask_size": int(no[best_no]) if best_no is not None else 0,
+    }
 
 
 def quote_from_market(market: dict) -> dict:
@@ -431,7 +464,10 @@ class KalshiClient:
         understates how many opportunities existed. The WS path is what makes
         the persistence statistics honest.
         """
-        books: dict[str, dict[str, list]] = {t: {"yes": [], "no": []} for t in tickers}
+        # price (dollars) -> resting size, per side, per ticker.
+        books: dict[str, dict[str, dict[float, float]]] = {
+            t: {"yes": {}, "no": {}} for t in tickers
+        }
         subscribe = json.dumps({
             "id": 1,
             "cmd": "subscribe",
@@ -440,6 +476,12 @@ class KalshiClient:
                 "market_tickers": tickers,
             },
         })
+
+        # websockets validates against the OS trust store, which a python.org
+        # macOS build does not populate — httpx works only because it bundles
+        # certifi. Point the WS at the same CA bundle rather than disabling
+        # verification, which would expose the signed key to a MITM.
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
         backoff = 1.0
         while True:
@@ -453,7 +495,7 @@ class KalshiClient:
                     ),
                 }
                 async with websockets.connect(
-                    self._ws_url, additional_headers=headers
+                    self._ws_url, additional_headers=headers, ssl=ssl_ctx
                 ) as ws:
                     await ws.send(subscribe)
                     log.info("Subscribed to orderbook_delta for %d markets", len(tickers))
@@ -475,27 +517,39 @@ class KalshiClient:
                             continue
 
                         if msg_type == "orderbook_snapshot":
+                            # A side is omitted entirely when its book is empty,
+                            # so rebuild both from scratch rather than merging.
                             books[ticker] = {
-                                "yes": payload.get("yes") or [],
-                                "no": payload.get("no") or [],
+                                "yes": _levels_from_snapshot(
+                                    payload.get("yes_dollars_fp")
+                                ),
+                                "no": _levels_from_snapshot(
+                                    payload.get("no_dollars_fp")
+                                ),
                             }
                         else:
-                            for side in ("yes", "no"):
-                                deltas = payload.get(side) or []
-                                levels = {e[0]: e[1] for e in books[ticker][side]}
-                                for price, qty in deltas:
-                                    if qty == 0:
-                                        levels.pop(price, None)
-                                    else:
-                                        levels[price] = qty
-                                books[ticker][side] = sorted(
-                                    ([p, q] for p, q in levels.items()),
-                                    key=lambda x: -x[0],
-                                )
+                            # A delta is a single price level and carries a
+                            # CHANGE in size, not the new size. Treating it as
+                            # absolute silently corrupts depth, which then feeds
+                            # the LP's size bounds and invents fillable volume.
+                            side = payload.get("side")
+                            if side not in ("yes", "no"):
+                                continue
+                            price = _num(payload.get("price_dollars"))
+                            change = _num(payload.get("delta_fp"))
+                            if price is None or change is None:
+                                continue
+
+                            levels = books[ticker][side]
+                            new_size = levels.get(price, 0.0) + change
+                            if new_size > 0:
+                                levels[price] = new_size
+                            else:
+                                levels.pop(price, None)
 
                         await queue.put((
                             ticker,
-                            parse_book({"orderbook": books[ticker]}),
+                            _book_from_levels(books[ticker]),
                             datetime.now(timezone.utc),
                         ))
 

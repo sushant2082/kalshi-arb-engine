@@ -18,6 +18,7 @@ from arbengine.scanner import (
     near_miss,
     refresh_group,
     scan_all,
+    stream_scan,
 )
 from arbengine.source.kalshi import KalshiClient, load_private_key
 
@@ -161,6 +162,87 @@ async def _discover(settings: Settings) -> None:
             )
 
 
+async def _run_stream(settings: Settings, duration_sec: float | None) -> None:
+    """Event-driven scan over the WebSocket feed."""
+    key = load_private_key(settings.kalshi_private_key_path)
+    conn = await storage.init_db(settings.db_path)
+    tracker = PersistenceTracker()
+    broker = _make_broker(settings)
+    positions: list = []
+
+    async with KalshiClient(
+        settings.kalshi_base_url, settings.kalshi_ws_url,
+        settings.kalshi_api_key_id, key,
+    ) as client:
+        log.info("Discovering groups for series: %s", ", ".join(settings.target_series))
+        groups = await build_groups(client, settings)
+        if not groups:
+            log.error("No validated groups. Run `arbengine discover` to pick targets.")
+            await conn.close()
+            return
+
+        legs = sum(len(g.tickers) for g in groups)
+        log.info("Streaming %d groups (%d markets)", len(groups), legs)
+
+        async def on_opportunity(opp, group) -> None:
+            now = datetime.now(timezone.utc)
+            tracked = tracker.observe(opp).model_copy(update={"last_seen": now})
+            await storage.upsert_opportunity(conn, tracked)
+            alerts.print_opportunity(tracked, settings.max_leg_count_alert)
+            alerts.append_to_csv(
+                tracked, settings.csv_output_path, settings.max_leg_count_alert
+            )
+            if broker:
+                pos = broker.attempt(tracked, now)
+                if pos:
+                    pos.id = await storage.save_position(conn, pos)
+                    positions.append(pos)
+                    alerts.print_position(pos)
+
+        try:
+            stats = await stream_scan(
+                client, groups, settings, on_opportunity, stop_after_sec=duration_sec
+            )
+            log.info(
+                "Stream ended: %d book updates, %d group re-scans, %d opportunities",
+                stats["updates"], stats["scans"], stats["opportunities"],
+            )
+        except KeyboardInterrupt:
+            log.info("Interrupted")
+        finally:
+            if broker and positions:
+                alerts.print_summary(summarize(positions, broker.starting_bankroll))
+            await _print_persistence(conn)
+            await conn.close()
+
+
+def _make_broker(settings: Settings) -> PaperBroker | None:
+    if not settings.paper_enabled:
+        return None
+    return PaperBroker(
+        bankroll=settings.paper_bankroll,
+        max_sets_per_opp=settings.paper_max_sets_per_opp,
+        leg_fill_prob=settings.paper_leg_fill_prob,
+        slippage_cents=settings.paper_slippage_cents,
+        fee_multiplier=settings.fee_multiplier,
+    )
+
+
+async def _print_persistence(conn) -> None:
+    stats = await storage.persistence_stats(conn)
+    if not stats:
+        return
+    print("── Persistence by type " + "─" * 42)
+    for row in stats:
+        print(
+            f"  {row['type']:<15} n={row['n']:<5} "
+            f"mean={row['mean_sec'] or 0:.1f}s  "
+            f"max={row['max_sec'] or 0:.1f}s  "
+            f"mean_profit=${row['mean_profit'] or 0:.2f}"
+        )
+    print("─" * 64)
+
+
 async def _run_scan(settings: Settings, once: bool, max_iterations: int | None) -> None:
     key = load_private_key(settings.kalshi_private_key_path)
     conn = await storage.init_db(settings.db_path)
@@ -275,8 +357,16 @@ def run() -> None:
         description="Kalshi static-arbitrage detection engine (read-only, paper trading only)",
     )
     parser.add_argument(
-        "command", nargs="?", default="scan", choices=["scan", "discover"],
-        help="scan: run the detection loop. discover: list candidate series.",
+        "command", nargs="?", default="scan",
+        choices=["scan", "stream", "discover"],
+        help=(
+            "scan: REST polling loop. stream: event-driven WebSocket scan. "
+            "discover: list candidate series."
+        ),
+    )
+    parser.add_argument(
+        "--duration", type=float, default=None,
+        help="stream only: stop after N seconds",
     )
     parser.add_argument("--once", action="store_true", help="single scan pass, then exit")
     parser.add_argument("--iterations", type=int, default=None, help="stop after N passes")
@@ -293,6 +383,8 @@ def run() -> None:
     try:
         if args.command == "discover":
             asyncio.run(_discover(settings))
+        elif args.command == "stream":
+            asyncio.run(_run_stream(settings, args.duration))
         else:
             asyncio.run(_run_scan(settings, args.once, args.iterations))
     except KeyboardInterrupt:

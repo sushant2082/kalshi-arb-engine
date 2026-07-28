@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import numpy as np
 
 from arbengine.groups import (
+    close_quantization_gaps,
     NEG_INF,
     POS_INF,
     build_group,
@@ -237,3 +238,62 @@ def test_markets_bucket_by_event() -> None:
     buckets = group_markets_by_event(markets)
     assert set(buckets) == {"E1", "E2"}
     assert len(buckets["E1"]) == 2
+
+
+# ── Quantization gaps ─────────────────────────────────────────────────────────
+
+def test_inclusive_bracket_slivers_are_closed() -> None:
+    """
+    Kalshi `between` brackets are inclusive on both ends, so [55700, 55799.99]
+    and [55800, 55899.99] leave a one-cent sliver when read as half-open. The
+    variable is quantized, so that sliver is unreachable and must not sink an
+    otherwise valid group.
+    """
+    intervals = [
+        (NEG_INF, 55700.0), (55700.0, 55799.99),
+        (55800.0, 55899.99), (55900.0, POS_INF),
+    ]
+    closed, n = close_quantization_gaps(intervals)
+    assert n == 2
+    assert closed[1] == (55700.0, 55800.0)
+    assert closed[2] == (55800.0, 55900.0)
+
+
+def test_a_real_missing_bracket_is_not_closed() -> None:
+    """A whole absent bracket leaves a full-width gap and must still reject."""
+    intervals = [
+        (55700.0, 55799.99), (55800.0, 55899.99),
+        # [55900, 55999.99] is missing entirely
+        (56000.0, 56099.99),
+    ]
+    closed, _ = close_quantization_gaps(intervals)
+    space = build_state_space(closed)
+    matrix = build_payoff_matrix(closed, space)
+    assert not validate_group(closed, space, matrix, "bracket").ok
+
+
+def test_real_btc_bracket_set_validates_end_to_end() -> None:
+    """The exact shape KXBTC publishes: inclusive brackets plus both tails."""
+    markets = [{"ticker": "LO", "event_ticker": "E", "strike_type": "less",
+                "cap_strike": 55700}]
+    floor = 55700.0
+    for i in range(6):
+        markets.append({
+            "ticker": f"B{i}", "event_ticker": "E", "strike_type": "between",
+            "floor_strike": floor + i * 100, "cap_strike": floor + i * 100 + 99.99,
+        })
+    markets.append({"ticker": "HI", "event_ticker": "E", "strike_type": "greater",
+                    "floor_strike": floor + 600})
+
+    contracts = [contract_from_market(m, _book(), NOW) for m in markets]
+    group = build_group("E", "S", "E", contracts)
+
+    assert group is not None, "real KXBTC bracket geometry must validate"
+    assert group.shape == "bracket"
+    # Every state covered exactly once.
+    assert np.all(group.payoff.sum(axis=0) == 1)
+
+
+def test_gap_closing_needs_no_finite_brackets_to_be_safe() -> None:
+    assert close_quantization_gaps([(NEG_INF, 5.0), (5.0, POS_INF)])[1] == 0
+    assert close_quantization_gaps([])[1] == 0

@@ -6,15 +6,18 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from arbengine.config import Settings
+import numpy as np
+
 from arbengine.detectors.lp import detect_lp
 from arbengine.detectors.specialized import run_specialized
+from arbengine.fees import fee_per_contract
 from arbengine.groups import (
     build_group,
     contract_from_market,
     group_markets_by_event,
 )
 from arbengine.models import ArbOpportunity, ContractGroup, opportunity_key
-from arbengine.source.kalshi import KalshiClient
+from arbengine.source.kalshi import KalshiClient, quote_from_market
 
 log = logging.getLogger(__name__)
 
@@ -101,13 +104,18 @@ def scan_group(
     Run specialized detectors then the LP against one validated group, and
     return everything that clears the profit and size thresholds.
     """
+    # Kalshi scales the taker fee per series, so a fee-free series must not be
+    # charged the standard rate — that would filter out exactly the locks most
+    # likely to be real.
+    fee_multiplier = settings.fee_multiplier * group.fee_scale
+
     found = run_specialized(
-        group, settings.fee_multiplier, now, min_profit=0.0
+        group, fee_multiplier, now, min_profit=0.0
     )
 
     lp_opp = detect_lp(
         group,
-        settings.fee_multiplier,
+        fee_multiplier,
         now,
         tolerance=settings.lp_tolerance,
         min_profit=0.0,
@@ -145,7 +153,24 @@ async def build_groups(
     """
     groups: list[ContractGroup] = []
 
+    try:
+        fee_scales = await client.series_fee_scales(settings.target_series)
+    except Exception as exc:
+        log.warning(
+            "Could not read per-series fee metadata (%s); "
+            "falling back to the standard rate for every series", exc,
+        )
+        fee_scales = {}
+
     for series in settings.target_series:
+        fee_scale = fee_scales.get(series, 1.0)
+        if fee_scale != 1.0:
+            log.info(
+                "Series %s has a non-standard fee scale of %.3f "
+                "(effective multiplier %.4f)",
+                series, fee_scale, settings.fee_multiplier * fee_scale,
+            )
+
         try:
             markets = await client.list_markets(series_ticker=series)
         except Exception as exc:
@@ -159,21 +184,23 @@ async def build_groups(
         by_event = group_markets_by_event(markets)
         log.info("Series %s: %d markets in %d events", series, len(markets), len(by_event))
 
+        now = datetime.now(timezone.utc)
         for event_ticker, event_markets in by_event.items():
             if len(event_markets) < 2:
                 continue
 
-            tickers = [m.get("ticker", "") for m in event_markets if m.get("ticker")]
-            books = await client.get_books(tickers)
-            now = datetime.now(timezone.utc)
-
+            # Quotes come from the same /markets payload as the strikes, so
+            # every leg in an event shares one timestamp — no cross-leg skew,
+            # and no per-market request storm.
             contracts = [
-                contract_from_market(m, books.get(m.get("ticker", "")), now)
+                contract_from_market(m, quote_from_market(m), now)
                 for m in event_markets
             ]
             contracts = [c for c in contracts if c.tradeable]
 
-            group = build_group(event_ticker, series, event_ticker, contracts)
+            group = build_group(
+                event_ticker, series, event_ticker, contracts, fee_scale=fee_scale
+            )
             if group:
                 groups.append(group)
 
@@ -184,23 +211,92 @@ async def build_groups(
 async def refresh_group(
     client: KalshiClient, group: ContractGroup
 ) -> ContractGroup:
-    """Re-fetch quotes for an existing group, keeping its state space intact."""
-    books = await client.get_books(group.tickers)
+    """
+    Re-fetch quotes for an existing group, keeping its state space intact.
+
+    One /markets call scoped to the event refreshes every leg at once. Beyond
+    saving requests, this is what keeps the legs time-consistent: quotes pulled
+    one-by-one drift apart, and comparing a fresh leg against a stale one
+    manufactures arbitrage that was never there.
+    """
+    try:
+        markets = await client.list_markets(event_ticker=group.event_ticker)
+    except Exception as exc:
+        log.debug("Refresh failed for %s: %s", group.group_id, exc)
+        return group
+
+    quotes = {
+        m.get("ticker"): quote_from_market(m) for m in markets if m.get("ticker")
+    }
     now = datetime.now(timezone.utc)
+
     updated = []
     for c in group.contracts:
-        book = books.get(c.ticker)
-        if book is None:
+        q = quotes.get(c.ticker)
+        if q is None:
             updated.append(c)
             continue
         updated.append(c.model_copy(update={
-            "bid": book["bid"],
-            "ask": book["ask"],
-            "bid_size": book["bid_size"],
-            "ask_size": book["ask_size"],
+            "bid": q["bid"],
+            "ask": q["ask"],
+            "bid_size": q["bid_size"],
+            "ask_size": q["ask_size"],
             "fetched_at": now,
         }))
     return group.model_copy(update={"contracts": updated})
+
+
+def near_miss(group: ContractGroup, settings: Settings) -> dict:
+    """
+    Measure how far a group is from violating coherence, whether or not it does.
+
+    A bare "no violations" is indistinguishable from a detector that is silently
+    broken. The margin makes the difference observable: a ladder sitting 2 cents
+    from inversion is a live near-miss worth watching, while one sitting 40
+    cents away is genuinely coherent.
+
+    Returns the best (least negative) margin in dollars per set. Positive means
+    an actual violation.
+    """
+    fee_mult = settings.fee_multiplier * group.fee_scale
+    contracts = group.contracts
+    payoff = group.payoff
+
+    best_mono = None
+    for i, a in enumerate(contracts):
+        for j, b in enumerate(contracts):
+            if i == j:
+                continue
+            if not (
+                bool(np.all(payoff[j] >= payoff[i]))
+                and bool(np.any(payoff[j] > payoff[i]))
+            ):
+                continue
+            if a.bid is None or b.ask is None or a.bid_size <= 0 or b.ask_size <= 0:
+                continue
+            margin = (a.bid - fee_per_contract(a.bid, fee_mult)) - (
+                b.ask + fee_per_contract(b.ask, fee_mult)
+            )
+            if best_mono is None or margin > best_mono:
+                best_mono = margin
+
+    partition_cost = None
+    if group.shape == "bracket" and all(
+        c.ask is not None and c.ask_size > 0 for c in contracts
+    ):
+        if np.all(payoff.sum(axis=0) == 1):
+            partition_cost = sum(
+                c.ask + fee_per_contract(c.ask, fee_mult) for c in contracts
+            )
+
+    return {
+        "group_id": group.group_id,
+        "shape": group.shape,
+        "legs": len(contracts),
+        "quoted": sum(1 for c in contracts if c.ask is not None),
+        "monotonic_margin": best_mono,
+        "partition_cost": partition_cost,
+    }
 
 
 def scan_all(

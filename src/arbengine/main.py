@@ -15,6 +15,7 @@ from arbengine.paper import PaperBroker, summarize
 from arbengine.scanner import (
     PersistenceTracker,
     build_groups,
+    near_miss,
     refresh_group,
     scan_all,
 )
@@ -33,6 +34,57 @@ def _setup_logging(verbose: bool) -> None:
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
+BRACKET_STRIKE_TYPES = (
+    "between", "greater", "greater_or_equal", "less", "less_or_equal",
+)
+
+# Categories where outcome variables are numeric and get bracketed. Sports,
+# Politics and Entertainment are overwhelmingly binary or parlay markets, and
+# sweeping them just burns rate limit.
+DISCOVER_CATEGORIES = (
+    "Crypto",
+    "Climate and Weather",
+    "Economics",
+    "Financials",
+    "Commodities",
+)
+
+
+async def _probe_series(client: KalshiClient, ticker: str, fee_scale: float) -> dict | None:
+    """Sample one series' open markets and score it as an arbitrage target."""
+    try:
+        markets = await client.list_markets(series_ticker=ticker, max_pages=1)
+    except Exception:
+        return None
+    if not markets:
+        return None
+
+    by_event: dict[str, list[dict]] = {}
+    for m in markets:
+        by_event.setdefault(m.get("event_ticker") or "", []).append(m)
+
+    bracketed = sum(
+        1 for m in markets if m.get("strike_type") in BRACKET_STRIKE_TYPES
+    )
+    # Events with 3+ legs are where coherence actually has room to break; a
+    # 2-leg event is effectively a binary market.
+    multi_leg = sum(1 for ms in by_event.values() if len(ms) >= 3)
+    widest = max((len(ms) for ms in by_event.values()), default=0)
+
+    if not bracketed or not multi_leg:
+        return None
+
+    return {
+        "ticker": ticker,
+        "markets": len(markets),
+        "events": len(by_event),
+        "bracketed": bracketed,
+        "multi_leg_events": multi_leg,
+        "widest_event": widest,
+        "fee_scale": fee_scale,
+    }
+
+
 async def _discover(settings: Settings) -> None:
     """List candidate bracketed/laddered series so TARGET_SERIES can be set."""
     key = load_private_key(settings.kalshi_private_key_path)
@@ -40,36 +92,73 @@ async def _discover(settings: Settings) -> None:
         settings.kalshi_base_url, settings.kalshi_ws_url,
         settings.kalshi_api_key_id, key,
     ) as client:
-        markets = await client.list_markets()
-        by_series: dict[str, list[dict]] = {}
-        for m in markets:
-            series = (m.get("ticker") or "").split("-")[0]
-            by_series.setdefault(series, []).append(m)
+        log.info("Reading series metadata...")
+        all_series = await client.list_series()
+        fee_scales = {
+            s.get("ticker"): float(s.get("fee_multiplier", 1) or 0)
+            for s in all_series
+            if s.get("ticker")
+        }
 
-        print(f"\n{len(markets)} open markets across {len(by_series)} series\n")
-        print(f"{'SERIES':<20} {'MKTS':>5} {'EVENTS':>7} {'BRACKETED':>10}  SAMPLE")
-        print("─" * 90)
-
-        rows = []
-        for series, ms in by_series.items():
-            events = {m.get("event_ticker") for m in ms}
-            bracketed = sum(
-                1 for m in ms
-                if m.get("strike_type") in
-                ("between", "greater", "greater_or_equal", "less", "less_or_equal")
-            )
-            rows.append((series, len(ms), len(events), bracketed, ms[0].get("ticker", "")))
-
-        # Rank by bracket density — that is where coherence actually breaks.
-        rows.sort(key=lambda r: (-r[3], -r[1]))
-        for series, n, n_ev, brk, sample in rows[:40]:
-            print(f"{series:<20} {n:>5} {n_ev:>7} {brk:>10}  {sample}")
-
-        print(
-            "\nSet TARGET_SERIES to the series with high bracket counts and "
-            "many markets per event.\nTwo-sided moneylines (BRACKETED=0) are "
-            "not worth scanning — they almost never violate coherence.\n"
+        candidates = [
+            s for s in all_series
+            if s.get("category") in DISCOVER_CATEGORIES
+            # Recurring series regenerate brackets constantly and are the most
+            # likely to have live, thin, uncoordinated books.
+            and s.get("frequency") in ("hourly", "daily", "weekly", "monthly")
+        ]
+        log.info(
+            "%d series in bracket-friendly categories; probing open markets...",
+            len(candidates),
         )
+
+        results = []
+        probed = 0
+        for s in candidates:
+            ticker = s.get("ticker")
+            row = await _probe_series(client, ticker, fee_scales.get(ticker, 1.0))
+            probed += 1
+            if row:
+                row["category"] = s.get("category")
+                row["frequency"] = s.get("frequency")
+                results.append(row)
+            if probed % 50 == 0:
+                log.info("  probed %d/%d, %d live", probed, len(candidates), len(results))
+
+        if not results:
+            print("\nNo bracketed series with open multi-leg events found.\n")
+            return
+
+        # Rank by the widest single event first. Coherence breaks where many
+        # thin related contracts share one outcome variable, so one 75-leg
+        # bracket set is a far better target than a dozen 3-leg events — more
+        # pairs that can contradict each other, and thinner books on each leg.
+        results.sort(key=lambda r: (-r["widest_event"], -r["multi_leg_events"]))
+
+        print(f"\n{len(results)} candidate series with live bracketed events\n")
+        header = (
+            f"{'SERIES':<22} {'CATEGORY':<20} {'FREQ':<8} {'MKTS':>5} "
+            f"{'EVENTS':>6} {'BRACKET':>8} {'3+LEG':>6} {'WIDEST':>7} {'FEE':>5}"
+        )
+        print(header)
+        print("─" * len(header))
+        for r in results[:40]:
+            print(
+                f"{r['ticker']:<22} {r['category']:<20} {r['frequency']:<8} "
+                f"{r['markets']:>5} {r['events']:>6} {r['bracketed']:>8} "
+                f"{r['multi_leg_events']:>6} {r['widest_event']:>7} "
+                f"{r['fee_scale']:>5.2g}"
+            )
+
+        top = [r["ticker"] for r in results[:8]]
+        print(f"\nSuggested:\n  TARGET_SERIES={','.join(top)}\n")
+
+        free = [r["ticker"] for r in results if r["fee_scale"] == 0]
+        if free:
+            print(
+                f"Fee-free series (FEE=0), where thin locks actually survive:\n"
+                f"  {','.join(free)}\n"
+            )
 
 
 async def _run_scan(settings: Settings, once: bool, max_iterations: int | None) -> None:
@@ -101,6 +190,7 @@ async def _run_scan(settings: Settings, once: bool, max_iterations: int | None) 
                 "No validated groups. Check TARGET_SERIES — run `arbengine discover` "
                 "to see which series currently have bracketed markets."
             )
+            await conn.close()
             return
 
         iteration = 0
@@ -137,9 +227,23 @@ async def _run_scan(settings: Settings, once: bool, max_iterations: int | None) 
                 tracker.expire_absent(seen_keys)
 
                 if not found:
+                    # "No violations" alone cannot be distinguished from a
+                    # detector that is silently inert, so report how close the
+                    # tightest groups actually came.
+                    margins = [
+                        m for m in (near_miss(g, settings) for g in groups)
+                        if m["monotonic_margin"] is not None
+                    ]
+                    margins.sort(key=lambda m: -m["monotonic_margin"])
                     log.info(
                         "Scan %d: no violations across %d groups", iteration, len(groups)
                     )
+                    for m in margins[:3]:
+                        log.info(
+                            "    closest: %s (%s, %d legs) %.4f from inverting",
+                            m["group_id"], m["shape"], m["legs"],
+                            -m["monotonic_margin"],
+                        )
 
                 if once or (max_iterations and iteration >= max_iterations):
                     break

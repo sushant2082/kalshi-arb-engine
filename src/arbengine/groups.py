@@ -187,9 +187,65 @@ def build_state_space(intervals: list[Interval]) -> StateSpace:
 
 
 def _fmt(x: float) -> str:
+    if x == NEG_INF:
+        return "-inf"
+    if x == POS_INF:
+        return "+inf"
     if x == int(x):
         return str(int(x))
-    return f"{x:g}"
+    # Not %g: its 6-significant-digit default renders 55799.99 as "55800",
+    # which makes adjacent boundaries look identical in validation messages.
+    return f"{x:.10g}".rstrip("0").rstrip(".") if abs(x) < 1e10 else repr(x)
+
+
+# Kalshi's `between` brackets are inclusive on BOTH ends, so consecutive
+# brackets read as [55700, 55799.99] then [55800, 55899.99]. Converted to
+# half-open intervals that leaves a one-cent sliver uncovered between every
+# pair. The underlying variable is quantized, so those slivers are unreachable
+# — but a genuinely missing bracket is a real gap and must still be rejected.
+# A sliver is distinguished from a real gap by size relative to a typical
+# bracket: a missing bracket leaves a gap of roughly one full bracket width.
+QUANT_GAP_RATIO = 0.05
+
+
+def close_quantization_gaps(
+    intervals: list[Interval],
+) -> tuple[list[Interval], int]:
+    """
+    Snap away sub-tick gaps left by inclusive-upper-bound brackets.
+
+    Returns the adjusted intervals and how many gaps were closed, so callers
+    can log the adjustment rather than have it happen invisibly.
+    """
+    finite = [
+        (lo, hi) for lo, hi in intervals
+        if math.isfinite(lo) and math.isfinite(hi)
+    ]
+    if len(finite) < 2:
+        return list(intervals), 0
+
+    widths = sorted(hi - lo for lo, hi in finite if hi > lo)
+    if not widths:
+        return list(intervals), 0
+    median_width = widths[len(widths) // 2]
+    if median_width <= 0:
+        return list(intervals), 0
+
+    tolerance = median_width * QUANT_GAP_RATIO
+    out = list(intervals)
+    order = sorted(range(len(out)), key=lambda i: out[i][0])
+
+    closed = 0
+    for a, b in zip(order, order[1:]):
+        hi_a, lo_b = out[a][1], out[b][0]
+        if not (math.isfinite(hi_a) and math.isfinite(lo_b)):
+            continue
+        gap = lo_b - hi_a
+        if 0 < gap <= tolerance:
+            out[a] = (out[a][0], lo_b)
+            closed += 1
+
+    return out, closed
 
 
 def _covers(interval: Interval, state: Interval) -> bool:
@@ -337,6 +393,7 @@ def build_group(
     series_ticker: str,
     event_ticker: str,
     contracts: list[Contract],
+    fee_scale: float = 1.0,
 ) -> ContractGroup | None:
     """
     Assemble a validated ContractGroup. Returns None when the group cannot be
@@ -349,6 +406,12 @@ def build_group(
         return None
 
     intervals = [c.interval for c in usable]
+    intervals, closed = close_quantization_gaps(intervals)
+    if closed:
+        log.debug(
+            "Group %s: closed %d sub-tick gaps from inclusive bracket bounds",
+            group_id, closed,
+        )
     shape = infer_shape(intervals)
     state_space = build_state_space(intervals)
     payoff = build_payoff_matrix(intervals, state_space)
@@ -367,6 +430,7 @@ def build_group(
         payoff=payoff,
         validation=validation,
         shape=shape,
+        fee_scale=fee_scale,
     )
 
 

@@ -1,7 +1,8 @@
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -33,7 +34,14 @@ class Settings(BaseSettings):
     # ── Scan targets ───────────────────────────────────────────────────────────
     # Bracketed/laddered series only. Single moneyline games almost never
     # violate coherence and are a waste of rate limit.
-    target_series: list[str] = ["KXBTCD", "KXETHD", "KXHIGHNY", "KXCPIYOY"]
+    #
+    # NoDecode is required: without it pydantic-settings treats any list field
+    # as complex and JSON-decodes the raw env value before field validators
+    # run, so a plain comma-separated TARGET_SERIES raises a JSONDecodeError
+    # instead of reaching _split_series below.
+    target_series: Annotated[list[str], NoDecode] = [
+        "KXBTCD", "KXETHD", "KXHIGHNY", "KXCPIYOY",
+    ]
 
     # ── Polling ────────────────────────────────────────────────────────────────
     kalshi_poll_sec: int = 10
@@ -57,8 +65,20 @@ class Settings(BaseSettings):
     @field_validator("target_series", mode="before")
     @classmethod
     def _split_series(cls, v: object) -> object:
+        """
+        Accept both a comma-separated string (from env) and a real list (from
+        code or tests). Also tolerates a JSON array, since that is what the
+        default pydantic-settings decoder would have expected.
+        """
         if isinstance(v, str):
-            return [s.strip() for s in v.split(",") if s.strip()]
+            text = v.strip()
+            if text.startswith("["):
+                import json
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    pass
+            return [s.strip() for s in text.split(",") if s.strip()]
         return v
 
     @field_validator("fee_multiplier")

@@ -88,6 +88,9 @@ class ContractGroup(BaseModel):
     validation: GroupValidation
     # "bracket" (disjoint ranges) or "ladder" (nested "at least K" thresholds).
     shape: Literal["bracket", "ladder", "binary"] = "bracket"
+    # Series-level scaling on the base fee multiplier, from Kalshi's /series
+    # metadata. 1.0 is the standard rate; 0.0 means the series is fee-free.
+    fee_scale: float = 1.0
 
     @property
     def tickers(self) -> list[str]:

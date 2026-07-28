@@ -132,12 +132,50 @@ Env-driven via `pydantic-settings`; see `src/arbengine/config.py`.
 | `TARGET_SERIES` | — | comma-separated series tickers to scan |
 | `KALSHI_POLL_SEC` / `MAX_QUOTE_AGE_SEC` | `10` / `30` | poll interval and staleness guard |
 
+## What the live data actually looks like
+
+Verified against the live API on 2026-07-28 (181 bracketed series open):
+
+**Almost everything wide is a ladder, not a partition.** `KXBTCD`, `KXNATGASD`,
+`KXCPIYOY`, `KXWTI` and friends publish nested `greater` ("above K") contracts —
+75 to 188 legs on one outcome variable. So the monotonic detector, not the
+partition detector, is where the edge lives.
+
+**Wide bracket partitions can't fire, structurally.** `KXBTC` publishes 188 true
+`between` brackets, but the asks sum to over $3 because far-out-of-the-money
+brackets are quoted at the $0.01 minimum tick when they're worth ~$0. Add a
+minimum $0.01 fee per leg and a 188-leg partition carries $1.88 of fees alone.
+No partition arbitrage is possible at that width — don't wait on one.
+
+**The ladders sit 2–5 cents from inverting.** That is the real finding. It is
+close enough that violations plausibly occur intermittently, and far enough that
+they weren't present in any pass so far. This is a question only sustained
+monitoring answers, which is what the persistence table is for.
+
+`scan` prints the three closest groups on every pass that finds nothing —
+"no violations" on its own can't be distinguished from a detector that is
+silently inert.
+
 ## Known limitations
 
 **Fee model is conservative.** The full per-contract fee is charged at the
 quoted price so the LP stays linear. Kalshi rounds once per order, so this
 slightly *understates* profit — the safe direction for an arbitrage check, but
-it means marginal opportunities get filtered out.
+it means marginal opportunities get filtered out. The per-series scaling factor
+is read live from `/series`; `FEE_MULTIPLIER` is only the base rate it scales.
+
+**Sub-tick bracket gaps are closed automatically.** Kalshi's `between` brackets
+are inclusive on both ends, so consecutive brackets read as `[55700, 55799.99]`
+and `[55800, 55899.99]`, leaving a one-cent sliver when converted to half-open
+intervals. Those slivers are unreachable (the variable is quantized) and are
+snapped shut. The tolerance is 5% of the median bracket width, so a genuinely
+missing bracket still fails validation — but a series with wildly uneven bracket
+widths could in principle have a real gap absorbed.
+
+**Detection uses top of book only.** Quotes come from `/markets`, which carries
+level one and its size. That keeps every leg in an event on one timestamp and
+avoids a request storm, but it means fillable size is capped at the best level;
+deeper liquidity is invisible to the LP's depth bounds.
 
 **Inclusive vs exclusive strike bounds are collapsed.** `greater` (x > K) and
 `greater_or_equal` (x >= K) both normalize to `(K, ∞)`. Kalshi's numeric strikes

@@ -58,32 +58,97 @@ def _sign(private_key: RSAPrivateKey, timestamp_ms: int, method: str, path: str)
     return base64.b64encode(sig).decode()
 
 
+def _num(v: object) -> float | None:
+    """Kalshi returns numerics as strings in the _fp/_dollars fields."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_book(data: dict) -> dict:
     """
     Normalize a Kalshi order book into YES-side {bid, ask, bid_size, ask_size}.
 
-    Kalshi publishes two bid ladders and no ask ladder: `yes` holds bids to buy
-    YES, `no` holds bids to buy NO, both in cents descending. A resting NO bid
-    at price p is an offer to sell YES at (100 - p), so:
+    Kalshi publishes two bid ladders and no ask ladder: one holds bids to buy
+    YES, the other bids to buy NO. A resting NO bid at price p is an offer to
+    sell YES at (1 - p), so:
 
-        best YES bid  = yes[0].price            (where you can sell YES)
-        best YES ask  = 100 - no[0].price       (where you can buy YES)
+        best YES bid  = best yes bid           (where you can sell YES)
+        best YES ask  = 1 - best no bid        (where you can buy YES)
 
     and the size available at the YES ask is the size resting on that NO bid.
     Getting this inversion wrong silently turns every arbitrage check into
-    nonsense, so it is asserted in the tests against a captured fixture.
-    """
-    ob = data.get("orderbook") or {}
-    yes_bids: list[list[int]] = ob.get("yes") or []
-    no_bids: list[list[int]] = ob.get("no") or []
+    nonsense, so it is pinned in the tests against captured fixtures.
 
+    Two wire formats are handled:
+
+    - `orderbook_fp` with `yes_dollars`/`no_dollars`: decimal-dollar strings,
+      sorted **ascending**, so the best bid is the LAST entry.
+    - legacy `orderbook` with `yes`/`no`: integer cents, sorted descending, so
+      the best bid is the FIRST entry.
+
+    The ascending-vs-descending flip is the dangerous part: reading the wrong
+    end of the ladder yields a plausible-looking price that is the worst quote
+    on the book rather than the best.
+    """
+    ob_fp = data.get("orderbook_fp")
+    if ob_fp is not None:
+        yes_levels = ob_fp.get("yes_dollars") or []
+        no_levels = ob_fp.get("no_dollars") or []
+        # Ascending: best bid is the highest price, i.e. the last entry.
+        best_yes = yes_levels[-1] if yes_levels else None
+        best_no = no_levels[-1] if no_levels else None
+
+        bid = _num(best_yes[0]) if best_yes else None
+        bid_size = int(_num(best_yes[1]) or 0) if best_yes else 0
+        no_bid = _num(best_no[0]) if best_no else None
+        ask = round(1.0 - no_bid, 4) if no_bid is not None else None
+        ask_size = int(_num(best_no[1]) or 0) if best_no else 0
+
+        return {"bid": bid, "ask": ask, "bid_size": bid_size, "ask_size": ask_size}
+
+    ob = data.get("orderbook") or {}
+    yes_bids = ob.get("yes") or []
+    no_bids = ob.get("no") or []
+
+    # Descending: best bid is the first entry, prices in integer cents.
     best_yes_bid = yes_bids[0] if yes_bids else None
     best_no_bid = no_bids[0] if no_bids else None
 
     bid = best_yes_bid[0] / 100.0 if best_yes_bid else None
-    bid_size = best_yes_bid[1] if best_yes_bid else 0
+    bid_size = int(best_yes_bid[1]) if best_yes_bid else 0
     ask = (100 - best_no_bid[0]) / 100.0 if best_no_bid else None
-    ask_size = best_no_bid[1] if best_no_bid else 0
+    ask_size = int(best_no_bid[1]) if best_no_bid else 0
+
+    return {"bid": bid, "ask": ask, "bid_size": bid_size, "ask_size": ask_size}
+
+
+def quote_from_market(market: dict) -> dict:
+    """
+    Extract the YES-side top of book straight from market metadata.
+
+    `/markets` already carries `yes_bid_dollars`, `yes_ask_dollars` and their
+    sizes, so a whole event's quotes arrive in the same paginated call as its
+    strikes. Fetching one order book per market instead would mean ~188
+    requests for a single BTC event, which trips the rate limit immediately and
+    guarantees the legs are skewed in time. Order books are still worth pulling
+    for depth beyond level one, but not for detection.
+    """
+    bid = _num(market.get("yes_bid_dollars"))
+    ask = _num(market.get("yes_ask_dollars"))
+    bid_size = int(_num(market.get("yes_bid_size_fp")) or 0)
+    ask_size = int(_num(market.get("yes_ask_size_fp")) or 0)
+
+    # A zero-size quote is not a quote. Kalshi reports 0.00/0 for an empty side
+    # rather than omitting it, and treating that as a real $0.00 bid would let
+    # the LP "sell" into nothing.
+    if bid_size <= 0:
+        bid, bid_size = None, 0
+    if ask_size <= 0:
+        ask, ask_size = None, 0
 
     return {"bid": bid, "ask": ask, "bid_size": bid_size, "ask_size": ask_size}
 
@@ -96,12 +161,23 @@ class KalshiClient:
         key_id: str,
         private_key: RSAPrivateKey,
         timeout: float = 15.0,
+        max_retries: int = 5,
+        retry_base_delay: float = 1.0,
+        retry_max_delay: float = 30.0,
+        request_interval: float = 0.15,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._ws_url = ws_url
         self._key_id = key_id
         self._key = private_key
         self._http = httpx.AsyncClient(timeout=timeout)
+        self._max_retries = max_retries
+        self._retry_base_delay = retry_base_delay
+        self._retry_max_delay = retry_max_delay
+        # Minimum spacing between requests. Pagination fires back-to-back
+        # otherwise and trips the rate limit within a few pages.
+        self._request_interval = request_interval
+        self._last_request = 0.0
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -121,31 +197,128 @@ class KalshiClient:
             "Content-Type": "application/json",
         }
 
+    async def _throttle(self) -> None:
+        """Space requests out so pagination does not trip the rate limit."""
+        if self._request_interval <= 0:
+            return
+        elapsed = time.monotonic() - self._last_request
+        if elapsed < self._request_interval:
+            await asyncio.sleep(self._request_interval - elapsed)
+        self._last_request = time.monotonic()
+
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict:
+        """
+        Signed GET with retry on rate limiting and transient server errors.
+
+        Kalshi's per-key rate limit is easy to trip when paginating market
+        metadata, and a 429 partway through a scan would otherwise abort the
+        whole pass. 429 and 5xx are retried with exponential backoff, honouring
+        Retry-After when the server sends it. 401 fails immediately — no amount
+        of retrying fixes a bad key, and hammering an unauthorized key is how
+        you get blocked.
+        """
         url = self._base_url + path
-        try:
-            resp = await self._http.get(url, headers=self._headers(path), params=params)
-            if resp.status_code == 401:
-                raise PermissionError(
-                    "Kalshi 401 Unauthorized — check KALSHI_API_KEY_ID and the private key"
+        delay = self._retry_base_delay
+
+        for attempt in range(self._max_retries + 1):
+            try:
+                await self._throttle()
+                resp = await self._http.get(
+                    url, headers=self._headers(path), params=params
                 )
-            if resp.status_code == 429:
-                log.warning("Kalshi rate limited on %s; backing off", path)
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as exc:
-            log.warning("Kalshi HTTP %s on %s", exc.response.status_code, path)
-            raise
-        except httpx.RequestError as exc:
-            log.warning("Kalshi request error on %s: %s", path, exc)
-            raise
+
+                if resp.status_code == 401:
+                    raise PermissionError(
+                        "Kalshi 401 Unauthorized — check KALSHI_API_KEY_ID and the private key"
+                    )
+
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    if attempt >= self._max_retries:
+                        log.warning(
+                            "Kalshi %s on %s: out of retries", resp.status_code, path
+                        )
+                        resp.raise_for_status()
+
+                    wait = delay
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait = max(wait, float(retry_after))
+                        except ValueError:
+                            pass
+
+                    log.warning(
+                        "Kalshi %s on %s; retrying in %.1fs (attempt %d/%d)",
+                        resp.status_code, path, wait, attempt + 1, self._max_retries,
+                    )
+                    await asyncio.sleep(wait)
+                    delay = min(delay * 2, self._retry_max_delay)
+                    continue
+
+                resp.raise_for_status()
+                return resp.json()
+
+            except httpx.HTTPStatusError as exc:
+                log.warning("Kalshi HTTP %s on %s", exc.response.status_code, path)
+                raise
+            except httpx.RequestError as exc:
+                if attempt >= self._max_retries:
+                    log.warning("Kalshi request error on %s: %s", path, exc)
+                    raise
+                log.warning(
+                    "Kalshi request error on %s: %s; retrying in %.1fs", path, exc, delay
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._retry_max_delay)
+
+        raise RuntimeError(f"Kalshi GET {path} exhausted retries")
 
     # ── Discovery ─────────────────────────────────────────────────────────────
 
     async def list_series(self, category: str | None = None) -> list[dict]:
+        """
+        List series metadata. Beyond discovery, this is the authoritative source
+        for `fee_multiplier` and `fee_type` per series — see series_fee_scale.
+        """
         params = {"category": category} if category else None
         data = await self._get("/series", params=params)
         return data.get("series", [])
+
+    async def get_series(self, series_ticker: str) -> dict:
+        data = await self._get(f"/series/{series_ticker}")
+        return data.get("series", data)
+
+    async def series_fee_scales(
+        self, series_tickers: list[str] | None = None
+    ) -> dict[str, float]:
+        """
+        Map series ticker → its fee scaling factor.
+
+        Kalshi's quoted taker fee is quadratic in price, and each series carries
+        a multiplier that scales it. Almost every series reports 1 (the standard
+        rate), but a handful report 0 — genuinely fee-free. That distinction
+        matters enormously here: fees are what kill most thin arbitrage, so a
+        fee-free series is where marginal locks actually survive. Hardcoding
+        0.07 for everything would both miss those and misprice any series Kalshi
+        reprices later.
+
+        Returns the raw scale factor; multiply FEE_MULTIPLIER by it.
+        """
+        series = await self.list_series()
+        wanted = set(series_tickers) if series_tickers else None
+        out: dict[str, float] = {}
+        for s in series:
+            ticker = s.get("ticker")
+            if not ticker or (wanted is not None and ticker not in wanted):
+                continue
+            scale = s.get("fee_multiplier")
+            if scale is None:
+                continue
+            try:
+                out[ticker] = float(scale)
+            except (TypeError, ValueError):
+                continue
+        return out
 
     async def list_events(
         self, series_ticker: str, status: str = "open", limit: int = 200
@@ -174,13 +347,20 @@ class KalshiClient:
         event_ticker: str | None = None,
         status: str = "open",
         limit: int = 200,
+        max_pages: int | None = None,
     ) -> list[dict]:
         """
         List market metadata. This is where strike_type, floor_strike and
         cap_strike come from, which groups.py turns into outcome intervals.
+
+        `max_pages` bounds an unfiltered sweep. Kalshi has tens of thousands of
+        open markets, so paginating all of them just to survey what exists
+        burns rate limit for no benefit — the caller says how deep to look and
+        is told when the result was truncated.
         """
         markets: list[dict] = []
         cursor: str | None = None
+        pages = 0
         while True:
             params: dict[str, Any] = {"status": status, "limit": limit}
             if series_ticker:
@@ -191,8 +371,15 @@ class KalshiClient:
                 params["cursor"] = cursor
             data = await self._get("/markets", params=params)
             markets.extend(data.get("markets", []))
+            pages += 1
             cursor = data.get("cursor") or None
             if not cursor:
+                break
+            if max_pages is not None and pages >= max_pages:
+                log.info(
+                    "Stopped after %d pages (%d markets); more available",
+                    pages, len(markets),
+                )
                 break
         return markets
 

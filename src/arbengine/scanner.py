@@ -175,7 +175,9 @@ async def build_groups(
             )
 
         try:
-            markets = await client.list_markets(series_ticker=series)
+            markets, cache_age = await client.list_markets_with_age(
+                series_ticker=series
+            )
         except Exception as exc:
             log.warning("Could not list markets for %s: %s", series, exc)
             continue
@@ -187,7 +189,9 @@ async def build_groups(
         by_event = group_markets_by_event(markets)
         log.info("Series %s: %d markets in %d events", series, len(markets), len(by_event))
 
-        now = datetime.now(timezone.utc)
+        # See refresh_group: back-date past the CDN cache so the staleness
+        # guard measures when the quotes were true, not when they arrived.
+        now = datetime.now(timezone.utc) - timedelta(seconds=cache_age)
         for event_ticker, event_markets in by_event.items():
             if len(event_markets) < 2:
                 continue
@@ -223,7 +227,9 @@ async def refresh_group(
     manufactures arbitrage that was never there.
     """
     try:
-        markets = await client.list_markets(event_ticker=group.event_ticker)
+        markets, cache_age = await client.list_markets_with_age(
+            event_ticker=group.event_ticker
+        )
     except Exception as exc:
         log.debug("Refresh failed for %s: %s", group.group_id, exc)
         return group
@@ -231,7 +237,12 @@ async def refresh_group(
     quotes = {
         m.get("ticker"): quote_from_market(m) for m in markets if m.get("ticker")
     }
-    now = datetime.now(timezone.utc)
+    # Back-date to when the quotes were actually true, not when we received
+    # them. Kalshi serves /markets through a 15-second CDN cache, so a response
+    # that arrives now can describe a book from 15 seconds ago. Stamping it
+    # "now" would tell the staleness guard everything is fresh and let it
+    # compare a live leg against a stale one.
+    now = datetime.now(timezone.utc) - timedelta(seconds=cache_age)
 
     updated = []
     for c in group.contracts:

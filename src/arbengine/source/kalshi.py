@@ -186,6 +186,62 @@ def quote_from_market(market: dict) -> dict:
     return {"bid": bid, "ask": ask, "bid_size": bid_size, "ask_size": ask_size}
 
 
+class TokenBucket:
+    """
+    Client-side mirror of Kalshi's server-side token bucket.
+
+    Kalshi meters requests by token cost against a budget that refills
+    continuously — there are no fixed windows. Modelling the same bucket here
+    means we pace to the real constraint instead of guessing at a fixed request
+    interval, and we stop tripping 429 rather than reacting to it.
+
+    A fixed-interval throttle is wrong in both directions: it wastes headroom
+    when idle (the server banks unspent tokens, capacity permitting) and it
+    still bursts past the limit when several coroutines fetch concurrently.
+
+    The lock matters. Without it, concurrent callers all read the balance
+    before any of them debits it, and the "throttle" lets the whole fleet
+    through at once — which is exactly how the earlier version kept getting
+    rate limited while appearing to be conservative.
+    """
+
+    def __init__(self, refill_rate: float, capacity: float) -> None:
+        self.refill_rate = refill_rate
+        self.capacity = capacity
+        self._tokens = capacity
+        self._updated = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        self._tokens = min(
+            self.capacity, self._tokens + (now - self._updated) * self.refill_rate
+        )
+        self._updated = now
+
+    async def acquire(self, cost: float) -> None:
+        """Block until `cost` tokens are available, then debit them."""
+        async with self._lock:
+            while True:
+                self._refill()
+                if self._tokens >= cost:
+                    self._tokens -= cost
+                    return
+                deficit = cost - self._tokens
+                await asyncio.sleep(deficit / self.refill_rate)
+
+    def penalize(self, cost: float) -> None:
+        """
+        Drain tokens after a 429 to resynchronize with the server.
+
+        A 429 means the server's balance was lower than ours — usually because
+        another process shares the key. Emptying the local bucket lets it refill
+        in step with the server's rather than immediately over-spending again.
+        """
+        self._tokens = 0.0
+        self._updated = time.monotonic()
+
+
 class KalshiClient:
     def __init__(
         self,
@@ -195,9 +251,18 @@ class KalshiClient:
         private_key: RSAPrivateKey,
         timeout: float = 15.0,
         max_retries: int = 5,
-        retry_base_delay: float = 1.0,
-        retry_max_delay: float = 30.0,
-        request_interval: float = 0.15,
+        # Kalshi applies no penalty or cooldown on 429 — the bucket just keeps
+        # refilling — so backoff only needs to cover the refill of one request's
+        # cost (50ms at the Basic Read budget), not seconds.
+        retry_base_delay: float = 0.1,
+        retry_max_delay: float = 5.0,
+        # Basic tier Read: 200 tokens/sec, bucket holds 2 seconds of budget.
+        read_budget: float = 200.0,
+        bucket_capacity: float | None = None,
+        request_cost: float = 10.0,
+        # Stay just under the budget so a shared key or clock skew does not
+        # push us over the server's balance.
+        safety_factor: float = 0.9,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._ws_url = ws_url
@@ -207,10 +272,15 @@ class KalshiClient:
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._retry_max_delay = retry_max_delay
-        # Minimum spacing between requests. Pagination fires back-to-back
-        # otherwise and trips the rate limit within a few pages.
-        self._request_interval = request_interval
-        self._last_request = 0.0
+        self._request_cost = request_cost
+        self._bucket = TokenBucket(
+            refill_rate=read_budget * safety_factor,
+            capacity=(
+                bucket_capacity
+                if bucket_capacity is not None
+                else read_budget * 2.0
+            ),
+        )
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -231,15 +301,16 @@ class KalshiClient:
         }
 
     async def _throttle(self) -> None:
-        """Space requests out so pagination does not trip the rate limit."""
-        if self._request_interval <= 0:
-            return
-        elapsed = time.monotonic() - self._last_request
-        if elapsed < self._request_interval:
-            await asyncio.sleep(self._request_interval - elapsed)
-        self._last_request = time.monotonic()
+        """Pace against the modelled token budget."""
+        await self._bucket.acquire(self._request_cost)
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict:
+        data, _ = await self._get_with_age(path, params)
+        return data
+
+    async def _get_with_age(
+        self, path: str, params: dict[str, Any] | None = None
+    ) -> tuple[dict, float]:
         """
         Signed GET with retry on rate limiting and transient server errors.
 
@@ -272,7 +343,14 @@ class KalshiClient:
                         )
                         resp.raise_for_status()
 
+                    if resp.status_code == 429:
+                        # Our model over-estimated the server's balance; drain
+                        # the local bucket so it refills in step again.
+                        self._bucket.penalize(self._request_cost)
+
                     wait = delay
+                    # Kalshi does not currently send Retry-After, but honour it
+                    # if that changes rather than guessing.
                     retry_after = resp.headers.get("Retry-After")
                     if retry_after:
                         try:
@@ -289,7 +367,21 @@ class KalshiClient:
                     continue
 
                 resp.raise_for_status()
-                return resp.json()
+
+                # Kalshi serves market data through CloudFront with
+                # `Cache-Control: max-age=15`, so a 200 can be up to 15 seconds
+                # stale. `Age` is how stale. Without it, the staleness guard
+                # measures when we received the bytes rather than when the
+                # quotes were real, and happily compares a fresh leg against a
+                # 14-second-old one — which manufactures arbitrage.
+                age = 0.0
+                raw_age = resp.headers.get("Age")
+                if raw_age:
+                    try:
+                        age = max(0.0, float(raw_age))
+                    except ValueError:
+                        pass
+                return resp.json(), age
 
             except httpx.HTTPStatusError as exc:
                 log.warning("Kalshi HTTP %s on %s", exc.response.status_code, path)
@@ -391,7 +483,27 @@ class KalshiClient:
         burns rate limit for no benefit — the caller says how deep to look and
         is told when the result was truncated.
         """
+        markets, _ = await self.list_markets_with_age(
+            series_ticker, event_ticker, status, limit, max_pages
+        )
+        return markets
+
+    async def list_markets_with_age(
+        self,
+        series_ticker: str | None = None,
+        event_ticker: str | None = None,
+        status: str = "open",
+        limit: int = 200,
+        max_pages: int | None = None,
+    ) -> tuple[list[dict], float]:
+        """
+        As list_markets, plus the worst cache age across the pages fetched.
+
+        Callers should back-date the quote timestamp by this age; otherwise a
+        cached response looks fresh and defeats the staleness guard entirely.
+        """
         markets: list[dict] = []
+        worst_age = 0.0
         cursor: str | None = None
         pages = 0
         while True:
@@ -402,8 +514,9 @@ class KalshiClient:
                 params["event_ticker"] = event_ticker
             if cursor:
                 params["cursor"] = cursor
-            data = await self._get("/markets", params=params)
+            data, age = await self._get_with_age("/markets", params=params)
             markets.extend(data.get("markets", []))
+            worst_age = max(worst_age, age)
             pages += 1
             cursor = data.get("cursor") or None
             if not cursor:
@@ -414,7 +527,7 @@ class KalshiClient:
                     pages, len(markets),
                 )
                 break
-        return markets
+        return markets, worst_age
 
     # ── Quotes ────────────────────────────────────────────────────────────────
 
@@ -426,7 +539,7 @@ class KalshiClient:
         return parse_book(data)
 
     async def get_books(
-        self, tickers: list[str], concurrency: int = 8
+        self, tickers: list[str], concurrency: int = 16
     ) -> dict[str, dict]:
         """
         Fetch books for many markets concurrently, bounded so we do not trip

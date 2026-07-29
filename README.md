@@ -156,6 +156,43 @@ monitoring answers, which is what the persistence table is for.
 "no violations" on its own can't be distinguished from a detector that is
 silently inert.
 
+## Rate limiting and the CDN cache
+
+Two things about Kalshi's API shape the whole design, and neither is obvious
+from the docs.
+
+**Market data is CDN-cached for 15 seconds.** `/markets` comes back through
+CloudFront with `Cache-Control: max-age=15`; the `Age` header climbs 3 → 13 and
+resets on a miss. So a REST response can describe a book from 15 seconds ago,
+and polling faster than that returns byte-identical bytes. `KALSHI_POLL_SEC`
+defaults to 15 for that reason — below it you pay tokens to learn nothing.
+
+That is also a correctness issue, not just efficiency. The staleness guard
+measures when quotes were *true*, so both REST paths back-date their timestamps
+by the response's `Age`. Without it a cached response looks fresh, and the guard
+happily compares a live leg against a 14-second-old one — which manufactures
+arbitrage that never existed.
+
+**The WebSocket is the only real-time path.** It is not cached. If you care
+about violations that live less than 15 seconds — and the fee arithmetic says
+those are the only ones that survive fees — use `stream`, not `scan`.
+
+**Uncached requests cost ~5x the documented rate.** `GET
+/account/endpoint_costs` reports 10 tokens for `/markets`, and cache hits do
+behave that cheaply. A cache *miss* bills far more. Measured by forcing misses
+with distinct series tickers: clean at 3 misses/s, rate limited at 4.4, implying
+**~46 tokens per uncached call**. A 200/s Basic Read budget therefore sustains
+about 4 uncached requests per second, not 20.
+
+The average rate matters less than the burst. A scanner averaging 2 req/s still
+429s constantly if it fires each pass as a burst priced at 10 tokens per
+request. Calibrating `KALSHI_REQUEST_COST` to 50 took a representative run from
+191 rate-limit responses to zero.
+
+Per-second Read budgets by tier: basic 200, advanced 300, expert 600,
+premier 1000, paragon 2000, prime 4000, prestige 6000. Set
+`KALSHI_READ_BUDGET` to match yours.
+
 ## Known limitations
 
 **Fee model is conservative.** The full per-contract fee is charged at the

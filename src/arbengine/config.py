@@ -44,8 +44,45 @@ class Settings(BaseSettings):
     ]
 
     # ── Polling ────────────────────────────────────────────────────────────────
-    kalshi_poll_sec: int = 10
+    # Kalshi serves /markets through a CDN with Cache-Control: max-age=15.
+    # Polling faster returns byte-identical cached responses while the misses
+    # that do occur burn the token budget, so 15s is the floor at which REST
+    # can tell you anything new. Use `stream` for anything faster — the
+    # WebSocket is not cached and is the only real-time path.
+    kalshi_poll_sec: int = 15
+    # Must exceed the 15s cache TTL or every REST quote is rejected as stale
+    # once back-dated by its cache age.
     max_quote_age_sec: int = 30
+
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+    # Kalshi meters by token cost against a continuously refilling budget.
+    # Per-second Read budgets by tier: basic 200, advanced 300, expert 600,
+    # premier 1000, paragon 2000, prime 4000, prestige 6000. Market-data
+    # endpoints cost the default 10 tokens, so basic sustains ~20 req/s.
+    # GET /account/endpoint_costs is authoritative on non-default costs.
+    kalshi_read_budget: float = 200.0
+    # MEASURED, not the documented default. GET /account/endpoint_costs reports
+    # 10 tokens for /markets, and cache HITS do behave that cheaply — but Kalshi
+    # fronts market data with CloudFront, and a cache MISS bills far more.
+    # Calibration (distinct series tickers, forcing misses): clean at 3 misses/s,
+    # rate limited at 4.4 misses/s, implying ~46 tokens per uncached call. So a
+    # 200/s Read budget sustains roughly 4 uncached requests per second, not 20.
+    #
+    # This matters more than the average rate: a scanner averaging 2 req/s still
+    # 429s constantly if it fires each pass as a burst priced at 10 tokens.
+    kalshi_request_cost: float = 50.0
+    # Burst capacity, in seconds of budget. Kalshi documents two seconds for
+    # Basic/Advanced Read, but starting a run with a full two-second bucket
+    # fires a 40-request burst that 429s whenever the server's own bucket is
+    # not equally full — which it never is after discovery. Measured: an even
+    # 20 req/s is clean indefinitely, so cap the burst at one second and let
+    # the sustained rate do the work.
+    kalshi_bucket_seconds: float = 1.0
+    # Headroom against a shared key or clock skew.
+    kalshi_rate_safety: float = 0.9
+    # Concurrent in-flight requests. The token bucket is the real limiter, so
+    # this only bounds socket usage.
+    kalshi_concurrency: int = 16
 
     # ── Storage / output ───────────────────────────────────────────────────────
     db_path: Path = Path("arbengine.db")

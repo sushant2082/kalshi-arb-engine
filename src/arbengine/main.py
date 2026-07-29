@@ -25,6 +25,20 @@ from arbengine.source.kalshi import KalshiClient, load_private_key
 log = logging.getLogger("arbengine")
 
 
+def _client(settings: Settings, key) -> KalshiClient:
+    """Build a client paced to the configured Kalshi tier."""
+    return KalshiClient(
+        settings.kalshi_base_url,
+        settings.kalshi_ws_url,
+        settings.kalshi_api_key_id,
+        key,
+        read_budget=settings.kalshi_read_budget,
+        request_cost=settings.kalshi_request_cost,
+        bucket_capacity=settings.kalshi_read_budget * settings.kalshi_bucket_seconds,
+        safety_factor=settings.kalshi_rate_safety,
+    )
+
+
 def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -89,10 +103,7 @@ async def _probe_series(client: KalshiClient, ticker: str, fee_scale: float) -> 
 async def _discover(settings: Settings) -> None:
     """List candidate bracketed/laddered series so TARGET_SERIES can be set."""
     key = load_private_key(settings.kalshi_private_key_path)
-    async with KalshiClient(
-        settings.kalshi_base_url, settings.kalshi_ws_url,
-        settings.kalshi_api_key_id, key,
-    ) as client:
+    async with _client(settings, key) as client:
         log.info("Reading series metadata...")
         all_series = await client.list_series()
         fee_scales = {
@@ -170,10 +181,7 @@ async def _run_stream(settings: Settings, duration_sec: float | None) -> None:
     broker = _make_broker(settings)
     positions: list = []
 
-    async with KalshiClient(
-        settings.kalshi_base_url, settings.kalshi_ws_url,
-        settings.kalshi_api_key_id, key,
-    ) as client:
+    async with _client(settings, key) as client:
         log.info("Discovering groups for series: %s", ", ".join(settings.target_series))
         groups = await build_groups(client, settings)
         if not groups:
@@ -225,10 +233,7 @@ async def _run_backtest(settings: Settings) -> None:
     between "the code compiles" and "the code works when it matters".
     """
     key = load_private_key(settings.kalshi_private_key_path)
-    async with KalshiClient(
-        settings.kalshi_base_url, settings.kalshi_ws_url,
-        settings.kalshi_api_key_id, key,
-    ) as client:
+    async with _client(settings, key) as client:
         groups = await build_groups(client, settings)
 
     if not groups:
@@ -306,10 +311,7 @@ async def _run_scan(settings: Settings, once: bool, max_iterations: int | None) 
     )
     positions = []
 
-    async with KalshiClient(
-        settings.kalshi_base_url, settings.kalshi_ws_url,
-        settings.kalshi_api_key_id, key,
-    ) as client:
+    async with _client(settings, key) as client:
         log.info("Discovering groups for series: %s", ", ".join(settings.target_series))
         groups = await build_groups(client, settings)
 

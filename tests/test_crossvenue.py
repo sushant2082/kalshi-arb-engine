@@ -66,18 +66,18 @@ def test_threshold_extraction_requires_one_unambiguous_number() -> None:
 
 # ── Risk assessment: the refusals ─────────────────────────────────────────────
 
-def test_different_thresholds_are_never_matched() -> None:
+def test_mismatched_strikes_are_matchable_in_the_safe_orientation() -> None:
     """
-    A $110k contract hedged against a $105k contract is not a hedge — it is a
-    spread with a hole in the middle where both legs lose.
+    Kalshi quotes ...99.99 strikes and Polymarket round numbers, so requiring
+    equality finds nothing. Equality is not required — one orientation is still
+    riskless. See test_strike_orientation_* for which one.
     """
-    risk, why = assess_risk(
+    risk, _ = assess_risk(
         "BTC above $110,000 at 8pm", "Will BTC be above $105,000 at 8pm?",
         Subject("BTC", 110000.0, "above", DEADLINE),
         Subject("BTC", 105000.0, "above", DEADLINE),
     )
-    assert risk is ResolutionRisk.UNKNOWN
-    assert "differ" in why
+    assert risk is not ResolutionRisk.UNKNOWN
 
 
 def test_different_settlement_times_are_never_matched() -> None:
@@ -128,6 +128,66 @@ def test_matching_crypto_thresholds_are_mechanical() -> None:
         Subject("BTC", 110000.0, "above", DEADLINE),
     )
     assert risk is ResolutionRisk.MECHANICAL
+
+
+# ── Strike orientation: the asymmetry that makes mismatched strikes usable ────
+
+def test_strike_orientation_above_lower_strike_supplies_yes() -> None:
+    """
+    Buying YES at the lower strike and NO at the higher can never pay $0: the
+    band between the strikes pays $2, which is upside. Reversed, that same band
+    pays nothing and BOTH legs lose together.
+    """
+    from arbengine.crossvenue import safe_orientation
+
+    assert safe_orientation(53999.99, 54000.0, "above") == "kalshi"
+    assert safe_orientation(54000.0, 53999.99, "above") == "polymarket"
+    assert safe_orientation(54000.0, 54000.0, "above") == "both"
+
+
+def test_strike_orientation_below_is_mirrored() -> None:
+    from arbengine.crossvenue import safe_orientation
+
+    assert safe_orientation(54000.0, 53999.99, "below") == "kalshi"
+    assert safe_orientation(53999.99, 54000.0, "below") == "polymarket"
+
+
+def test_safe_orientation_never_pays_zero_at_any_settlement() -> None:
+    """Exhaustive check of the claim the whole matching rule rests on."""
+    from arbengine.crossvenue import safe_orientation
+
+    for direction in ("above", "below"):
+        for ks, ps in ((100.0, 110.0), (110.0, 100.0), (105.0, 105.0)):
+            safe = safe_orientation(ks, ps, direction)
+            for x in (90.0, 100.0, 105.0, 110.0, 120.0):
+                if direction == "above":
+                    k_yes, p_yes = int(x > ks), int(x > ps)
+                else:
+                    k_yes, p_yes = int(x < ks), int(x < ps)
+                if safe in ("kalshi", "both"):
+                    assert k_yes + (1 - p_yes) >= 1, (
+                        f"{direction} Ks={ks} Ps={ps} X={x} paid 0"
+                    )
+                if safe in ("polymarket", "both"):
+                    assert p_yes + (1 - k_yes) >= 1, (
+                        f"{direction} Ks={ks} Ps={ps} X={x} paid 0"
+                    )
+
+
+def test_detection_refuses_the_unsafe_orientation() -> None:
+    """
+    Even when the unsafe side is priced more attractively, it must not be
+    offered — it is the orientation with a hole in it.
+    """
+    k = _q("kalshi", "K", 0.10, 0.91)   # cheap YES on the HIGHER strike
+    p = _q("polymarket", "P", 0.85, 0.16)
+    pair = MatchedPair(
+        kalshi=k, polymarket=p, risk=ResolutionRisk.MECHANICAL,
+        rationale="test", safe_yes_venue="polymarket",
+    )
+    opp = detect_cross_venue(pair, NOW)
+    # kalshi-YES would look cheapest (0.10 + 0.16) but is the unsafe side.
+    assert opp is None or opp.yes_venue == "polymarket"
 
 
 # ── Detection ─────────────────────────────────────────────────────────────────
@@ -207,3 +267,65 @@ def test_coherent_cross_venue_prices_do_not_fire() -> None:
     k = _q("kalshi", "K", 0.50, 0.51)
     p = _q("polymarket", "P", 0.50, 0.51)
     assert detect_cross_venue(_pair(ResolutionRisk.MECHANICAL, k, p), NOW) is None
+
+
+# ── Horizon-relative deadline tolerance ───────────────────────────────────────
+
+def test_short_dated_contracts_still_require_near_exact_settlement() -> None:
+    """
+    A two-hour gap on an hourly contract is the entire life of the market. The
+    underlying moves materially in between, so it does not hedge.
+    """
+    risk, why = assess_risk(
+        "BTC above $110,000", "Will BTC be above $110,000?",
+        Subject("BTC", 110000.0, "above", NOW + timedelta(hours=4)),
+        Subject("BTC", 110000.0, "above", NOW + timedelta(hours=6)),
+        now=NOW,
+    )
+    assert risk is ResolutionRisk.UNKNOWN
+    assert "short-dated" in why
+
+
+def test_long_dated_contracts_tolerate_a_small_relative_gap() -> None:
+    """The same two hours against a 150-day horizon is noise."""
+    risk, why = assess_risk(
+        "BTC above $150,000", "Will BTC be above $150,000?",
+        Subject("BTC", 150000.0, "above", NOW + timedelta(days=150)),
+        Subject("BTC", 150000.0, "above", NOW + timedelta(days=150, hours=2)),
+        now=NOW,
+    )
+    assert risk is ResolutionRisk.ALIGNED
+    assert "timing basis risk" in why
+
+
+def test_tolerated_timing_gap_is_never_rated_mechanical() -> None:
+    """
+    A tolerated gap is still real risk, so it must carry a bigger haircut than
+    a genuinely simultaneous pair.
+    """
+    exact, _ = assess_risk(
+        "BTC above $150,000", "Will BTC be above $150,000?",
+        Subject("BTC", 150000.0, "above", NOW + timedelta(days=150)),
+        Subject("BTC", 150000.0, "above", NOW + timedelta(days=150)),
+        now=NOW,
+    )
+    gapped, _ = assess_risk(
+        "BTC above $150,000", "Will BTC be above $150,000?",
+        Subject("BTC", 150000.0, "above", NOW + timedelta(days=150)),
+        Subject("BTC", 150000.0, "above", NOW + timedelta(days=150, hours=2)),
+        now=NOW,
+    )
+    assert exact is ResolutionRisk.MECHANICAL
+    assert gapped is ResolutionRisk.ALIGNED
+    assert DEFAULT_HAIRCUTS[gapped] > DEFAULT_HAIRCUTS[exact]
+
+
+def test_large_relative_gap_is_still_rejected_at_long_horizon() -> None:
+    risk, why = assess_risk(
+        "BTC above $150,000", "Will BTC be above $150,000?",
+        Subject("BTC", 150000.0, "above", NOW + timedelta(days=10)),
+        Subject("BTC", 150000.0, "above", NOW + timedelta(days=13)),
+        now=NOW,
+    )
+    assert risk is ResolutionRisk.UNKNOWN
+    assert "remaining horizon" in why

@@ -132,29 +132,56 @@ class PolymarketClient:
         resp.raise_for_status()
         return resp.json()
 
+    # Gamma silently caps `limit` at 100 regardless of what is requested, so
+    # paginating on offset is the only way to see past the first page. Sending
+    # limit=500 and breaking when fewer come back returns exactly one page and
+    # looks like "that is all there is".
+    PAGE_SIZE = 100
+
     async def list_markets(
-        self, limit: int = 500, max_pages: int = 6, order: str = "volume"
+        self,
+        max_pages: int = 20,
+        order: str = "volume",
+        tag_id: int | None = None,
+        include_closed: bool = False,
     ) -> list[dict]:
-        """Open, order-book-enabled markets, most liquid first."""
+        """
+        Open, order-book-enabled markets, most liquid first.
+
+        `tag_id` narrows to a Polymarket category (crypto is 21), which is far
+        cheaper than sweeping everything when the target is known.
+        """
         out: list[dict] = []
-        offset = 0
-        for _ in range(max_pages):
-            batch = await self._get(
-                f"{GAMMA_BASE}/markets",
-                params={
-                    "limit": limit,
-                    "offset": offset,
-                    "closed": "false",
-                    "order": order,
-                    "ascending": "false",
-                },
-            )
+        seen: set[str] = set()
+        for page in range(max_pages):
+            params: dict[str, Any] = {
+                "limit": self.PAGE_SIZE,
+                "offset": page * self.PAGE_SIZE,
+                "order": order,
+                "ascending": "false",
+            }
+            if not include_closed:
+                params["closed"] = "false"
+            if tag_id is not None:
+                params["tag_id"] = tag_id
+
+            try:
+                batch = await self._get(f"{GAMMA_BASE}/markets", params=params)
+            except httpx.HTTPStatusError as exc:
+                # Gamma 422s past a maximum offset rather than returning an
+                # empty page, so a deep sweep ends with an error, not a stop.
+                if exc.response.status_code == 422:
+                    log.debug("Gamma offset limit reached at page %d", page)
+                    break
+                raise
             if not batch:
                 break
-            out.extend(batch)
-            if len(batch) < limit:
+            fresh = [m for m in batch if str(m.get("id")) not in seen]
+            seen.update(str(m.get("id")) for m in batch)
+            out.extend(fresh)
+            if len(batch) < self.PAGE_SIZE:
                 break
-            offset += limit
+
         # Only markets with a live CLOB book are tradeable at a quoted price.
         return [
             m for m in out

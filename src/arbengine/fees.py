@@ -2,19 +2,36 @@ import math
 
 DEFAULT_FEE_MULTIPLIER = 0.07
 
+# Granularity the per-order fee is rounded UP to.
+#
+# docs.kalshi.com/getting_started/fee_rounding (read 2026-08-02) states the fee
+# is "rounded up to the nearest $0.0001 (centicent)" and that the accumulator is
+# maintained PER ORDER across fills — not per contract. The older widely-quoted
+# form rounds to the nearest cent. The difference is at most $0.0099 per order,
+# so it is minor next to the per-contract bug, but rounding to the cent when
+# Kalshi rounds to the centicent overstates fees on every single leg.
+FEE_ROUNDING = 0.0001
+
 
 def order_fee(
-    price: float, contracts: int, multiplier: float = DEFAULT_FEE_MULTIPLIER
+    price: float,
+    contracts: int,
+    multiplier: float = DEFAULT_FEE_MULTIPLIER,
+    rounding: float = FEE_ROUNDING,
 ) -> float:
     """
     Kalshi taker fee for an ORDER of `contracts` at `price`:
 
-        fee = ceil(multiplier * C * P * (1 - P) * 100) / 100
+        fee = roundup(multiplier * C * P * (1 - P), to=`rounding`)
 
-    One rounding for the whole order. This is the real charge, and the only
-    number that should ever be compared against a profit.
+    One rounding for the whole order — confirmed against Kalshi's fee-rounding
+    docs, which state the accumulator is maintained per order across fills.
+    This is the real charge, and the only number that should ever be compared
+    against a profit.
 
-    VERIFY `multiplier` against current Kalshi docs per market category.
+    `multiplier` is still UNVERIFIED against the current fee schedule and is
+    the single most load-bearing constant in this engine: every profit
+    threshold scales with it.
     """
     if not (0.0 <= price <= 1.0):
         raise ValueError(f"price must be in [0, 1] dollars, got {price}")
@@ -22,8 +39,9 @@ def order_fee(
         raise ValueError(f"contracts must be non-negative, got {contracts}")
     if contracts == 0:
         return 0.0
-    raw = multiplier * contracts * price * (1.0 - price) * 100.0
-    return math.ceil(raw) / 100.0
+    raw = multiplier * contracts * price * (1.0 - price)
+    steps = math.ceil(raw / rounding - 1e-9)
+    return steps * rounding
 
 
 def fee_per_contract(price: float, multiplier: float = DEFAULT_FEE_MULTIPLIER) -> float:

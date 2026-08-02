@@ -8,16 +8,16 @@ from arbengine.fees import buy_cost, fee_per_contract, sell_proceeds
 @pytest.mark.parametrize(
     "price, expected",
     [
-        # fee(P) = ceil(0.07 * P * (1-P) * 100) / 100
-        (0.50, 0.02),   # 0.07*0.25*100 = 1.75 → ceil 2 → $0.02
-        (0.20, 0.02),   # 0.07*0.16*100 = 1.12 → ceil 2 → $0.02
-        (0.90, 0.01),   # 0.07*0.09*100 = 0.63 → ceil 1 → $0.01
-        (0.00, 0.00),   # no fee at the boundaries
-        (1.00, 0.00),
+        # fee = roundup(0.07 * C * P * (1-P), to $0.0001), C = 1
+        (0.50, 0.0175),  # 0.07*0.25 = 0.0175 exactly
+        (0.20, 0.0112),  # 0.07*0.16 = 0.0112
+        (0.90, 0.0063),  # 0.07*0.09 = 0.0063
+        (0.00, 0.0000),  # no fee at the boundaries
+        (1.00, 0.0000),
     ],
 )
 def test_known_fee_values(price: float, expected: float) -> None:
-    assert fee_per_contract(price) == pytest.approx(expected)
+    assert fee_per_contract(price) == pytest.approx(expected, abs=1e-9)
 
 
 def test_fee_is_symmetric_about_one_half() -> None:
@@ -31,10 +31,20 @@ def test_fee_peaks_at_one_half() -> None:
         assert fee_per_contract(p) <= peak
 
 
-def test_fee_always_rounds_up_to_whole_cents() -> None:
+def test_fee_always_lands_on_a_centicent() -> None:
+    """Kalshi rounds the per-order fee up to $0.0001, not to the cent."""
     for i in range(0, 101):
         fee = fee_per_contract(i / 100)
-        assert math.isclose(fee * 100, round(fee * 100), abs_tol=1e-9)
+        assert math.isclose(fee * 10_000, round(fee * 10_000), abs_tol=1e-6)
+
+
+def test_rounding_is_always_upward() -> None:
+    from arbengine.fees import order_fee
+
+    for price in (0.005, 0.13, 0.5, 0.87):
+        for qty in (1, 3, 17, 250):
+            raw = 0.07 * qty * price * (1 - price)
+            assert order_fee(price, qty) >= raw - 1e-12
 
 
 def test_multiplier_scales_fee() -> None:
@@ -59,17 +69,41 @@ def test_price_outside_unit_interval_rejected() -> None:
 
 def test_fee_rounds_once_per_order_not_per_contract() -> None:
     """
-    Kalshi rounds the whole order up to a cent, once. Rounding a single
-    contract and multiplying is the failure this guards: at $0.005 a contract's
-    real fee is $0.0004 but rounds to a full cent on its own, so scaling it
-    overcharges 25x — and sub-penny legs are most of a wide bracket set.
+    Kalshi rounds the whole order up, once — per its fee-rounding docs, the
+    accumulator is maintained per order across fills.
+
+    Scaling a rounded single-contract fee always overcharges, because it pays
+    the rounding penalty once per contract instead of once per order.
     """
     from arbengine.fees import order_fee
 
-    # 100 contracts at $0.005: 0.07 * 100 * 0.005 * 0.995 = $0.035 -> $0.04
-    assert order_fee(0.005, 100) == pytest.approx(0.04)
-    # The broken model would have charged 100 x $0.01.
-    assert fee_per_contract(0.005) * 100 == pytest.approx(1.00)
+    # 100 at $0.005: 0.07 * 100 * 0.005 * 0.995 = $0.034825 -> $0.0349
+    assert order_fee(0.005, 100) == pytest.approx(0.0349, abs=1e-9)
+    # Per-contract scaling never undercharges, and here it overcharges.
+    assert fee_per_contract(0.005) * 100 > order_fee(0.005, 100)
+
+
+def test_cent_rounding_is_what_made_the_old_bug_catastrophic() -> None:
+    """
+    Pins the interaction between the two fee errors, because the magnitude of
+    the first depends entirely on the second.
+
+    Rounding per contract is wrong at any granularity, but it is merely
+    imprecise at centicent granularity and catastrophic at cent granularity: a
+    $0.005 contract owes $0.0004 and rounds to a full cent standalone, so
+    scaling it charged 25x. Sub-penny legs are most of a wide bracket set, so
+    that error is what suppressed detection.
+    """
+    from arbengine.fees import order_fee
+
+    cent_per_contract = order_fee(0.005, 1, rounding=0.01) * 100
+    true_fee = order_fee(0.005, 100)
+    assert cent_per_contract == pytest.approx(1.00)
+    assert cent_per_contract / true_fee > 25
+
+    # At the documented centicent granularity the same mistake is ~1.1x.
+    centicent_per_contract = order_fee(0.005, 1) * 100
+    assert 1.0 < centicent_per_contract / true_fee < 1.5
 
 
 def test_order_fee_of_one_matches_fee_per_contract() -> None:

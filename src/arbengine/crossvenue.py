@@ -93,6 +93,10 @@ class MatchedPair:
     subject: str = ""
     kalshi_rule: str = ""
     polymarket_rule: str = ""
+    # Which venue may supply the YES leg: "kalshi", "polymarket", or "both".
+    # None means unconstrained (equal strikes or not yet computed).
+    safe_yes_venue: str | None = None
+    strike_gap: float = 0.0
 
 
 @dataclass
@@ -229,9 +233,24 @@ _DIVERGENCE_FLAGS = (
     "if the event does not occur", "at the discretion",
 )
 
-# Deadlines this far apart make the two contracts different instruments even if
-# the question text matches, because the underlying can move in between.
+# Absolute deadline gap always tolerated, regardless of horizon.
 DEADLINE_TOLERANCE = timedelta(minutes=5)
+
+# Beyond that, what matters is the gap RELATIVE to time remaining, not the gap
+# itself. Kalshi settles crypto at 18:00/21:00 UTC and Polymarket at
+# 16:00/17:00 — they never coincide, so an absolute rule matches nothing. But a
+# two-hour gap means completely different things at different horizons: on an
+# hourly contract it is the entire life of the market and the underlying can
+# move percent in between, while on a six-month contract it is noise.
+#
+# So the gap is judged as a fraction of time-to-settlement. This is genuine
+# timing basis risk, not a free pass — it is why a pair that only clears this
+# test on relative grounds is capped at ALIGNED rather than MECHANICAL.
+MAX_RELATIVE_DEADLINE_GAP = 0.01
+
+# Below this horizon, only the absolute tolerance applies: a short-dated
+# contract has no room for the relative rule to be meaningful.
+MIN_HORIZON_FOR_RELATIVE = timedelta(days=2)
 
 
 def assess_risk(
@@ -239,6 +258,7 @@ def assess_risk(
     polymarket_text: str,
     kalshi_subject: Subject,
     polymarket_subject: Subject,
+    now: datetime | None = None,
 ) -> tuple[ResolutionRisk, str]:
     """
     Classify how safely two markets can be treated as the same question.
@@ -260,14 +280,9 @@ def assess_risk(
             "could not extract an unambiguous threshold from both questions",
         )
 
-    if not math.isclose(
-        kalshi_subject.threshold, polymarket_subject.threshold, rel_tol=1e-9
-    ):
-        return (
-            ResolutionRisk.UNKNOWN,
-            f"thresholds differ: {kalshi_subject.threshold} vs "
-            f"{polymarket_subject.threshold} — these are different contracts",
-        )
+    # Strikes need not be equal — see safe_orientation. In the correct
+    # orientation a strike gap is upside, not risk. Equality is only required
+    # for BOTH orientations to be legal.
 
     kd, pd = kalshi_subject.deadline, polymarket_subject.deadline
     if kd is None or pd is None:
@@ -275,12 +290,26 @@ def assess_risk(
             ResolutionRisk.UNKNOWN,
             "missing a settlement deadline on one or both venues",
         )
-    if abs(kd - pd) > DEADLINE_TOLERANCE:
-        return (
-            ResolutionRisk.UNKNOWN,
-            f"settlement times differ by {abs(kd - pd)} — the underlying can "
-            "move in between, so these do not hedge each other",
-        )
+    gap = abs(kd - pd)
+    timing_capped = False
+    if gap > DEADLINE_TOLERANCE:
+        horizon = min(kd, pd) - now if now else None
+        if horizon is None or horizon < MIN_HORIZON_FOR_RELATIVE:
+            return (
+                ResolutionRisk.UNKNOWN,
+                f"settlement times differ by {gap} on a short-dated contract — "
+                "the underlying can move materially in between, so these do "
+                "not hedge each other",
+            )
+        relative = gap.total_seconds() / horizon.total_seconds()
+        if relative > MAX_RELATIVE_DEADLINE_GAP:
+            return (
+                ResolutionRisk.UNKNOWN,
+                f"settlement times differ by {gap}, which is "
+                f"{relative:.1%} of the remaining horizon — too much to hedge",
+            )
+        # Tolerated, but it is still real timing basis risk.
+        timing_capped = True
 
     blob = f"{kalshi_text} {polymarket_text}".lower()
     hit = next((f for f in _DIVERGENCE_FLAGS if f in blob), None)
@@ -292,6 +321,12 @@ def assess_risk(
         )
 
     if kalshi_subject.asset in ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"):
+        if timing_capped:
+            return (
+                ResolutionRisk.ALIGNED,
+                f"same asset and threshold, but settlement times differ by "
+                f"{gap} — small against the horizon, still timing basis risk",
+            )
         return (
             ResolutionRisk.MECHANICAL,
             "same asset, threshold and settlement time against a public price "
@@ -303,6 +338,41 @@ def assess_risk(
         "same asset, threshold and settlement time, but the underlying is not "
         "a mechanically-priced reference",
     )
+
+
+def safe_orientation(
+    kalshi_strike: float, polymarket_strike: float, direction: str
+) -> Literal["kalshi", "polymarket", "both"] | None:
+    """
+    Which venue may supply the YES leg so the pair can never pay $0.
+
+    Kalshi and Polymarket almost never quote the same strike — Kalshi uses
+    `...99.99` levels, Polymarket round numbers — so requiring equality finds
+    nothing. It is not required. With mismatched strikes exactly one
+    orientation is still riskless, and the other has a hole in it.
+
+    For "above" contracts, with Kalshi strike Ks and Polymarket strike Ps:
+
+        buy Kalshi YES + Polymarket NO  pays  1{X > Ks} + 1{X <= Ps}
+
+    If Ks <= Ps this is >= 1 everywhere, and pays 2 in the band between the
+    strikes — the gap is a bonus, not an exposure. If Ks > Ps the same position
+    pays 0 for X in (Ps, Ks]: both legs lose together. So the venue with the
+    LOWER strike must supply YES. For "below" contracts the inequality flips
+    and the HIGHER strike supplies YES.
+
+    Returns "both" on equal strikes, the safe venue on a gap, or None if the
+    direction is not understood.
+    """
+    if direction == "above":
+        if math.isclose(kalshi_strike, polymarket_strike, rel_tol=1e-12):
+            return "both"
+        return "kalshi" if kalshi_strike < polymarket_strike else "polymarket"
+    if direction == "below":
+        if math.isclose(kalshi_strike, polymarket_strike, rel_tol=1e-12):
+            return "both"
+        return "kalshi" if kalshi_strike > polymarket_strike else "polymarket"
+    return None
 
 
 # ── Detection ─────────────────────────────────────────────────────────────────
@@ -336,10 +406,18 @@ def detect_cross_venue(
 
     best: CrossVenueOpportunity | None = None
 
-    for yes_venue, yes_q, no_q in (
-        ("kalshi", pair.kalshi, pair.polymarket),
-        ("polymarket", pair.polymarket, pair.kalshi),
-    ):
+    # Only orientations that cannot pay $0 are considered. With mismatched
+    # strikes one of the two is a trap that loses both legs together.
+    allowed = pair.safe_yes_venue or "both"
+    orientations = [
+        o for o in (
+            ("kalshi", pair.kalshi, pair.polymarket),
+            ("polymarket", pair.polymarket, pair.kalshi),
+        )
+        if allowed == "both" or o[0] == allowed
+    ]
+
+    for yes_venue, yes_q, no_q in orientations:
         if yes_q.yes_ask is None or no_q.no_ask is None:
             continue
         sets = min(yes_q.yes_ask_size, no_q.no_ask_size)

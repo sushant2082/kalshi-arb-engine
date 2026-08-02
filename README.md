@@ -156,6 +156,72 @@ monitoring answers, which is what the persistence table is for.
 "no violations" on its own can't be distinguished from a detector that is
 silently inert.
 
+## Watching it run
+
+```bash
+arbengine stream --ui         # live dashboard on the real feed
+arbengine demo --duration 60  # same dashboard, SYNTHETIC dislocations
+```
+
+The dashboard shows bankroll and paper P&L (locks and broken legs kept
+separate), feed throughput, the groups closest to violating, open positions,
+and an activity log.
+
+The "closest to arbitrage" panel is the important one. Nothing fires most of
+the time, and a dashboard that only lights up on a fill spends its life looking
+identical to a crashed process. The margins say whether the engine is a
+fraction of a cent from firing or nowhere near it.
+
+`demo` exists because the live books have not crossed yet, and a paper-trading
+path that has never executed is one nobody should trust. It runs real groups,
+real payoff matrices, real fees and the real broker against injected price
+dislocations, writing to a separate `arbengine-demo.db`.
+
+**Do not read demo P&L as evidence the strategy works.** It only shows the
+plumbing works. In one 40-second run the broken (unhedged) positions returned
++$589 — on a 6W/3L split. That is a coin flip on the settlement draw, not edge,
+which is exactly why the summary reports the win/loss split next to the number.
+
+Note that `realized/expected` above 1.0 is normal for ladder locks: the
+guaranteed profit is a worst-case floor, and most settlement states pay more.
+Below 1.0 is the alarming direction.
+
+## Cross-venue (Kalshi x Polymarket)
+
+`crossvenue.py` detects price gaps between Kalshi and Polymarket, and
+`source/polymarket.py` reads both the Gamma metadata API and the CLOB order
+books. Neither needs authentication.
+
+**These are not arbitrage in the sense the rest of this repo means it.** An
+intra-Kalshi lock is risk-free: one exchange, one rulebook, one settlement
+source. Kalshi versus Polymarket is two legal entities, two rulebooks and two
+oracles — Kalshi settles against a published CFTC-regulated rulebook,
+Polymarket against the UMA optimistic oracle with a dispute window. If they
+resolve the same question differently, the legs do not net to zero and **both
+can lose**. That risk is invisible in the order book.
+
+So every pair is assigned a resolution-risk tier and a haircut:
+
+| Tier | Meaning | Haircut |
+|---|---|---|
+| `MECHANICAL` | same asset, threshold and settlement instant against a public price reference | 0.2% |
+| `ALIGNED` | same event and criteria, not a mechanically-priced underlying | 1% |
+| `DIVERGENT` | resolution text mentions voids, ties, postponements or revisions | 5% |
+| `UNKNOWN` | could not establish the questions are the same | never tradeable |
+
+The matcher's job is refusal. Mismatched thresholds, settlement times more than
+five minutes apart, or an ambiguous strike all land in `UNKNOWN`. Hedging a
+$110k contract with a $105k one is not a hedge, it is a spread with a hole in
+the middle where both legs lose.
+
+Two corrections to common assumptions, both verified against the live API:
+
+- **Polymarket is not fee-free.** 99 of the top 100 markets have
+  `feesEnabled: true` with per-category schedules (sports is `rate: 0.05,
+  takerOnly: true`). Assuming zero fees manufactures arbitrage.
+- **Its books read best-price-last.** Bids ascend and asks descend, so index 0
+  is the worst quote on the book — the same trap Kalshi's ladders set.
+
 ## Rate limiting and the CDN cache
 
 Two things about Kalshi's API shape the whole design, and neither is obvious

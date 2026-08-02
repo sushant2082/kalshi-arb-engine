@@ -106,13 +106,20 @@ def print_summary(summary: dict) -> None:
     print(
         f"  broken     {summary['broken_count']:>4} positions  "
         f"P&L ${summary['broken_pnl']:+.2f}   "
-        f"← unhedged residuals, the number that decides if this is real",
+        f"({summary.get('broken_wins', 0)}W/{summary.get('broken_losses', 0)}L "
+        f"— unhedged, so this is a coin flip, not edge)",
         flush=True,
     )
     if summary["realization_ratio"] is not None:
+        ratio = summary["realization_ratio"]
+        if ratio < 0.95:
+            note = "BELOW 1.0 — the fee model or state space is wrong"
+        elif ratio > 1.05:
+            note = "above 1.0 is normal: ladder locks have upside above the floor"
+        else:
+            note = "matching the guaranteed floor"
         print(
-            f"  realized/expected on locked: {summary['realization_ratio']:.3f}"
-            f"   (well under 1.0 means the fee model or state space is wrong)",
+            f"  realized/expected on locked: {ratio:.3f}   ({note})",
             flush=True,
         )
     print("─" * 64 + "\n", flush=True)

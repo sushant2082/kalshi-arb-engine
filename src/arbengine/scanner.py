@@ -285,6 +285,7 @@ async def stream_scan(
     settings: Settings,
     on_opportunity,
     stop_after_sec: float | None = None,
+    state=None,
 ) -> dict:
     """
     Event-driven scan: re-check a group the instant any of its legs moves.
@@ -328,11 +329,15 @@ async def stream_scan(
                 ticker, book, ts = await queue.get()
 
             stats["updates"] += 1
+            if state is not None:
+                state.updates = stats["updates"]
 
             for idx in ticker_to_groups.get(ticker, ()):
                 live[idx] = apply_quote(live[idx], ticker, book, ts)
                 found = scan_group(live[idx], settings, ts)
                 stats["scans"] += 1
+                if state is not None:
+                    state.scans = stats["scans"]
                 for opp in found:
                     stats["opportunities"] += 1
                     await on_opportunity(opp, live[idx])

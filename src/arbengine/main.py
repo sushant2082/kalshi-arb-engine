@@ -4,11 +4,14 @@ CLI entrypoint. Detection and paper trading only — never places a real order.
 
 import argparse
 import asyncio
+import contextlib
 import logging
+import time
 import sys
 from datetime import datetime, timezone
 
 from arbengine import alerts, backtest as bt, storage
+from arbengine.dashboard import DashboardState, render
 from arbengine.config import Settings
 from arbengine.models import opportunity_key
 from arbengine.paper import PaperBroker, summarize
@@ -173,8 +176,12 @@ async def _discover(settings: Settings) -> None:
             )
 
 
-async def _run_stream(settings: Settings, duration_sec: float | None) -> None:
+async def _run_stream(
+    settings: Settings, duration_sec: float | None, ui: bool = False
+) -> None:
     """Event-driven scan over the WebSocket feed."""
+    if ui:
+        return await _run_stream_ui(settings, duration_sec)
     key = load_private_key(settings.kalshi_private_key_path)
     conn = await storage.init_db(settings.db_path)
     tracker = PersistenceTracker()
@@ -265,6 +272,211 @@ async def _run_backtest(settings: Settings) -> None:
         for r in s["failures"]:
             print(f"    {r.group_id} / {r.scenario}: worst=${r.worst_pnl:+.4f}")
     print("─" * 70 + "\n")
+
+
+async def _run_stream_ui(settings: Settings, duration_sec: float | None) -> None:
+    """Stream with the live terminal dashboard."""
+    from rich.console import Console
+    from rich.live import Live
+
+    from arbengine.scanner import near_miss
+
+    console = Console()
+    key = load_private_key(settings.kalshi_private_key_path)
+    conn = await storage.init_db(settings.db_path)
+    tracker = PersistenceTracker()
+    broker = _make_broker(settings)
+    state = DashboardState(
+        starting_bankroll=broker.starting_bankroll if broker else 0.0
+    )
+    positions: list = []
+
+    async with _client(settings, key) as client:
+        state.log("discovering groups…")
+        with Live(render(state), console=console, refresh_per_second=4,
+                  screen=True) as live:
+            groups = await build_groups(client, settings)
+            if not groups:
+                state.log("no validated groups — check TARGET_SERIES", "bold red")
+                live.update(render(state))
+                await asyncio.sleep(3)
+                await conn.close()
+                return
+
+            state.groups = len(groups)
+            state.markets = sum(len(g.tickers) for g in groups)
+            state.near_misses = [near_miss(g, settings) for g in groups]
+            state.log(f"streaming {state.groups} groups", "cyan")
+            live.update(render(state))
+
+            async def on_opportunity(opp, group) -> None:
+                now = datetime.now(timezone.utc)
+                tracked = tracker.observe(opp).model_copy(
+                    update={"last_seen": now}
+                )
+                await storage.upsert_opportunity(conn, tracked)
+                alerts.append_to_csv(
+                    tracked, settings.csv_output_path,
+                    settings.max_leg_count_alert,
+                )
+                state.record_opportunity(tracked)
+                if broker:
+                    pos = broker.attempt(tracked, now)
+                    if pos:
+                        pos.id = await storage.save_position(conn, pos)
+                        positions.append(pos)
+                        state.record_position(pos)
+                live.update(render(state))
+
+            # Refresh the dashboard on a timer independent of the feed, so a
+            # quiet market still shows a live clock rather than looking hung.
+            async def repaint() -> None:
+                while True:
+                    await asyncio.sleep(0.5)
+                    state.near_misses = [near_miss(g, settings) for g in groups]
+                    live.update(render(state))
+
+            painter = asyncio.create_task(repaint())
+            try:
+                stats = await stream_scan(
+                    client, groups, settings, on_opportunity,
+                    stop_after_sec=duration_sec, state=state,
+                )
+                state.updates = stats["updates"]
+                state.scans = stats["scans"]
+            finally:
+                painter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await painter
+                live.update(render(state))
+
+    if broker and positions:
+        alerts.print_summary(summarize(positions, broker.starting_bankroll))
+    await _print_persistence(conn)
+    await conn.close()
+
+
+async def _run_demo(settings: Settings, duration_sec: float = 60.0) -> None:
+    """
+    Drive the dashboard with SYNTHETIC dislocations against live market
+    geometry.
+
+    Real prices, real groups, real payoff matrices, real fee arithmetic and the
+    real paper broker — only the quote perturbation is injected. This exists
+    because the live books have not yet crossed, and a paper-trading path that
+    has never executed is a path nobody should trust. Every trade here is
+    labelled synthetic and written to a separate database so it can never be
+    confused with a real detection in the P&L.
+    """
+    import random
+
+    from rich.console import Console
+    from rich.live import Live
+
+    from arbengine import backtest as bt
+    from arbengine.scanner import near_miss, scan_group
+
+    console = Console()
+    key = load_private_key(settings.kalshi_private_key_path)
+    demo_db = settings.db_path.with_name("arbengine-demo.db")
+    conn = await storage.init_db(demo_db)
+    broker = _make_broker(settings)
+    state = DashboardState(
+        starting_bankroll=broker.starting_bankroll if broker else 0.0,
+        mode="demo (SYNTHETIC dislocations)",
+    )
+    rng = random.Random(20260802)
+    positions: list = []
+
+    async with _client(settings, key) as client:
+        with Live(render(state), console=console, refresh_per_second=6,
+                  screen=True) as live:
+            state.log("loading live market geometry…")
+            live.update(render(state))
+            groups = await build_groups(client, settings)
+            if not groups:
+                state.log("no validated groups", "bold red")
+                live.update(render(state))
+                await asyncio.sleep(3)
+                await conn.close()
+                return
+
+            state.groups = len(groups)
+            state.markets = sum(len(g.tickers) for g in groups)
+            state.near_misses = [near_miss(g, settings) for g in groups]
+            state.log(
+                f"{state.groups} live groups — injecting synthetic dislocations",
+                "yellow",
+            )
+            live.update(render(state))
+
+            started = time.monotonic()
+            while time.monotonic() - started < duration_sec:
+                group = rng.choice(groups)
+                margin = rng.choice([0.05, 0.04, 0.03, 0.02])
+
+                perturbed = None
+                if group.shape == "bracket":
+                    total = sum(
+                        c.ask for c in group.contracts if c.ask is not None
+                    )
+                    if total > 0:
+                        perturbed = bt._cheapen_all_asks(
+                            group, (1.0 - margin) / total
+                        )
+                if perturbed is None:
+                    perturbed = bt._invert_ladder_pair(group, margin)
+                if perturbed is None:
+                    await asyncio.sleep(0.2)
+                    continue
+
+                now = datetime.now(timezone.utc)
+                found = scan_group(perturbed, settings, now)
+                state.scans += 1
+                state.updates += len(perturbed.contracts)
+
+                for opp in found:
+                    await storage.upsert_opportunity(conn, opp)
+                    state.record_opportunity(opp)
+                    live.update(render(state))
+                    await asyncio.sleep(0.4)
+
+                    if broker:
+                        pos = broker.attempt(opp, now)
+                        if pos:
+                            pos.id = await storage.save_position(conn, pos)
+                            positions.append(pos)
+                            state.record_position(pos)
+                            live.update(render(state))
+                            await asyncio.sleep(0.4)
+
+                            # Settle against a randomly drawn outcome state, so
+                            # a broken hedge shows its real loss rather than
+                            # being quietly assumed to win.
+                            outcome = rng.randrange(perturbed.state_space.n)
+                            settled = broker.settle(
+                                pos, perturbed, outcome, datetime.now(timezone.utc)
+                            )
+                            settled.id = pos.id
+                            await storage.settle_position(conn, settled)
+                            state.settle_position(settled)
+                            positions[-1] = settled
+                            live.update(render(state))
+                            await asyncio.sleep(0.5)
+
+                await asyncio.sleep(0.3)
+
+            state.log("demo complete", "cyan")
+            live.update(render(state))
+            await asyncio.sleep(1.5)
+
+    if broker and positions:
+        alerts.print_summary(summarize(positions, broker.starting_bankroll))
+    console.print(
+        "[yellow]These were SYNTHETIC dislocations against live prices, "
+        f"written to {demo_db.name} — not real detections.[/yellow]"
+    )
+    await conn.close()
 
 
 def _make_broker(settings: Settings) -> PaperBroker | None:
@@ -406,16 +618,21 @@ def run() -> None:
     )
     parser.add_argument(
         "command", nargs="?", default="scan",
-        choices=["scan", "stream", "discover", "backtest"],
+        choices=["scan", "stream", "discover", "backtest", "demo"],
         help=(
             "scan: REST polling loop. stream: event-driven WebSocket scan. "
-            "discover: list candidate series. backtest: inject synthetic "
-            "dislocations into live groups and verify the lock end to end."
+            "discover: list candidate series. backtest: verify locks end to "
+            "end on live geometry. demo: watch paper trading run against "
+            "synthetic dislocations in the dashboard."
         ),
     )
     parser.add_argument(
         "--duration", type=float, default=None,
         help="stream only: stop after N seconds",
+    )
+    parser.add_argument(
+        "--ui", action="store_true",
+        help="stream only: live terminal dashboard",
     )
     parser.add_argument("--once", action="store_true", help="single scan pass, then exit")
     parser.add_argument("--iterations", type=int, default=None, help="stop after N passes")
@@ -433,9 +650,11 @@ def run() -> None:
         if args.command == "discover":
             asyncio.run(_discover(settings))
         elif args.command == "stream":
-            asyncio.run(_run_stream(settings, args.duration))
+            asyncio.run(_run_stream(settings, args.duration, args.ui))
         elif args.command == "backtest":
             asyncio.run(_run_backtest(settings))
+        elif args.command == "demo":
+            asyncio.run(_run_demo(settings, args.duration or 60.0))
         else:
             asyncio.run(_run_scan(settings, args.once, args.iterations))
     except KeyboardInterrupt:

@@ -214,7 +214,15 @@ def summarize(positions: list[PaperPosition], starting_bankroll: float) -> dict:
 
     expected = sum(p.expected_profit for p in locked)
 
+    # Broken positions are unhedged, so their P&L is a coin flip on the
+    # settlement draw, not edge. Reporting only the sum invites reading a lucky
+    # run as profitability, so the win/loss split travels with it.
+    broken_wins = sum(1 for p in broken if (p.pnl or 0) > 0)
+    broken_losses = len(broken) - broken_wins
+
     return {
+        "broken_wins": broken_wins,
+        "broken_losses": broken_losses,
         "starting_bankroll": starting_bankroll,
         "ending_bankroll": starting_bankroll + total_pnl,
         "total_pnl": total_pnl,

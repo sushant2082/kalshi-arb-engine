@@ -33,10 +33,17 @@ BASE = "https://api.sx.bet"
 ODDS_SCALE = 10**20
 USDC_SCALE = 10**6
 
-# SX Bet charges no fee on single bets. Recorded explicitly rather than left
-# implicit, because "no fee" is an assumption worth being able to find and
-# change if their schedule ever does.
+# VERIFIED fee policy:
+#   - single / straight bets: 0% for takers
+#   - parlays: 5%, charged only on the PROFIT of a winning parlay
+#   - gas: covered by SX Bet on standard betting transactions
+#
+# The within-market lock this module detects is two separate straight bets on
+# opposite outcomes, not a parlay, so the 5% never applies to it. That is the
+# whole reason this venue is interesting: it is the only surface here where the
+# gross gap IS the net gap.
 TAKER_FEE_RATE = 0.0
+PARLAY_FEE_RATE = 0.05  # on winning profit only; not applicable to straight bets
 
 
 def _int(v: object) -> int:
@@ -246,15 +253,46 @@ class SxBetClient:
         return out
 
 
-def detect_within_market(quote: SxQuote, min_profit: float = 0.0) -> dict | None:
+def push_possible(market: dict) -> bool:
     """
-    Check one SX Bet market for an internal lock.
+    Whether the market can settle to a push (a tie against the line).
 
-    Exactly one of the two outcomes occurs, so buying both for under $1 is a
-    guaranteed dollar — and with no taker fee, the gross gap is the net gap.
-    This is the same complement check the Kalshi detector runs, and it is
-    strictly intra-venue, so unlike a cross-venue pair it carries no resolution
-    basis risk.
+    A half-point line (-12.5, Over 166.5) cannot be pushed: no score lands on a
+    half. A whole-number line can. This matters because a push voids the bet
+    and returns the stake, which changes what a two-sided position is worth.
+    """
+    line = market.get("line")
+    if line is None:
+        return False
+    try:
+        return float(line) == int(float(line))
+    except (TypeError, ValueError):
+        return False
+
+
+def detect_within_market(
+    quote: SxQuote, min_profit: float = 0.0, market: dict | None = None
+) -> dict | None:
+    """
+    Check one SX Bet market for a two-sided position priced under $1.
+
+    IMPORTANT — this is not quite "guaranteed profit", and the difference is
+    worth stating rather than glossing.
+
+    Every SX Bet market carries a void outcome (`NO_CONTEST` on moneylines,
+    `NO_GAME_OR_EVEN` on totals and spreads). If the market voids, both legs
+    return their stake. So buying both sides for total cost C gives:
+
+        market resolves  ->  receive $1, profit 1 - C
+        market voids     ->  receive C,  profit 0
+
+    The position therefore cannot LOSE, which is a genuinely better risk
+    profile than any cross-venue pair, but the profit is conditional on the
+    event actually being contested. Reporting it as a guaranteed dollar would
+    overstate expected value on any market with real void probability.
+
+    With no taker fee on straight bets, the gross gap is the net gap — the only
+    surface in this engine where that is true.
     """
     total = quote.overround
     if total is None:
@@ -265,6 +303,8 @@ def detect_within_market(quote: SxQuote, min_profit: float = 0.0) -> dict | None
     sets = min(quote.one_ask_size, quote.two_ask_size)
     if sets <= 0:
         return None
+
+    void_name = (market or {}).get("outcomeVoidName") or ""
     return {
         "market_hash": quote.market_hash,
         "league": quote.league,
@@ -272,7 +312,13 @@ def detect_within_market(quote: SxQuote, min_profit: float = 0.0) -> dict | None
         "one_ask": quote.one_ask,
         "two_ask": quote.two_ask,
         "total_cost": total,
+        # Profit if the market resolves to one side. Zero if it voids.
         "profit_per_set": profit,
         "fillable": sets,
         "game_time": quote.game_time,
+        "void_outcome": void_name,
+        # A whole-number line can push, which voids. Half-point lines cannot.
+        "push_possible": push_possible(market or {}),
+        # Downside is zero, never negative: a void returns both stakes.
+        "worst_case_per_set": 0.0,
     }

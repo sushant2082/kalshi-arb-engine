@@ -152,7 +152,63 @@ def test_one_sided_book_cannot_lock() -> None:
     assert detect_within_market(q) is None
 
 
+def test_fee_policy_is_zero_for_the_strategy_this_engine_runs() -> None:
+    """
+    Buying both outcomes is two straight bets, so the 0% taker rate applies and
+    the 5% parlay fee does not. This is the only venue here where the gross gap
+    equals the net gap, which is the entire reason it is worth scanning.
+    """
+    from arbengine.source.sxbet import PARLAY_FEE_RATE, TAKER_FEE_RATE
+
+    assert TAKER_FEE_RATE == 0.0
+    assert PARLAY_FEE_RATE == 0.05
+
+    orders = [_order(False, 0.505, 1000), _order(True, 0.505, 1000)]
+    q = quote_from_orders(MARKET, orders, NOW)
+    hit = detect_within_market(q)
+    # A 1% gross gap survives intact; on Kalshi ~2 cents of fees would erase it.
+    assert hit is not None
+    assert hit["profit_per_set"] == pytest.approx(0.01)
+
+
 def test_game_time_is_parsed_to_utc() -> None:
     q = quote_from_orders(MARKET, [_order(True, 0.5, 100)], NOW)
     assert q.game_time is not None
     assert q.game_time.tzinfo is timezone.utc
+
+
+# ── Void outcomes: why this is "cannot lose", not "guaranteed profit" ─────────
+
+def test_push_is_possible_only_on_whole_number_lines() -> None:
+    """A score cannot land on a half point, so -12.5 can never push."""
+    from arbengine.source.sxbet import push_possible
+
+    assert push_possible({"line": -12.0}) is True
+    assert push_possible({"line": 166.0}) is True
+    assert push_possible({"line": -12.5}) is False
+    assert push_possible({"line": 166.5}) is False
+    assert push_possible({}) is False
+
+
+def test_result_records_the_void_outcome_and_zero_downside() -> None:
+    """
+    Every SX Bet market can void, returning both stakes. The position cannot
+    lose, but the profit is conditional on the event being contested — so the
+    worst case is recorded as zero rather than the position being called a
+    guaranteed dollar.
+    """
+    orders = [_order(False, 0.55, 1000), _order(True, 0.55, 1000)]
+    q = quote_from_orders(MARKET, orders, NOW)
+    hit = detect_within_market(q, market={**MARKET, "outcomeVoidName": "NO_CONTEST",
+                                          "line": -12.0})
+    assert hit["void_outcome"] == "NO_CONTEST"
+    assert hit["push_possible"] is True
+    assert hit["worst_case_per_set"] == 0.0
+    assert hit["profit_per_set"] > 0
+
+
+def test_half_point_line_cannot_push() -> None:
+    orders = [_order(False, 0.55, 1000), _order(True, 0.55, 1000)]
+    q = quote_from_orders(MARKET, orders, NOW)
+    hit = detect_within_market(q, market={**MARKET, "line": -12.5})
+    assert hit["push_possible"] is False

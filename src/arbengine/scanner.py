@@ -286,7 +286,8 @@ async def stream_scan(
     on_opportunity,
     stop_after_sec: float | None = None,
     state=None,
-    scan_interval_sec: float = 0.25,
+    scan_interval_sec: float | None = None,
+    scan_workers: int | None = None,
 ) -> dict:
     """
     Event-driven scan: apply book updates immediately, scan on a bounded cadence.
@@ -311,6 +312,13 @@ async def stream_scan(
     2. OFFLOAD. The LP runs in a worker thread so the event loop stays free to
        answer pings while scipy is busy.
     """
+    scan_interval_sec = (
+        scan_interval_sec
+        if scan_interval_sec is not None
+        else getattr(settings, "scan_interval_sec", 0.25)
+    )
+    workers = scan_workers or getattr(settings, "scan_workers", 4)
+
     ticker_to_groups: dict[str, list[int]] = {}
     for idx, g in enumerate(groups):
         for t in g.tickers:
@@ -348,10 +356,20 @@ async def stream_scan(
             batch = sorted(dirty)
             dirty.clear()
             now = datetime.now(timezone.utc)
-            for idx in batch:
-                group = live[idx]
-                # scipy blocks; keep it off the loop so pings still get answered.
-                found = await asyncio.to_thread(scan_group, group, settings, now)
+            # Solve groups concurrently. scipy releases the GIL in its compiled
+            # paths, so wide groups genuinely overlap rather than queueing.
+            sem = asyncio.Semaphore(workers)
+
+            async def solve(idx: int):
+                async with sem:
+                    group = live[idx]
+                    found = await asyncio.to_thread(
+                        scan_group, group, settings, now
+                    )
+                    return group, found
+
+            for coro in asyncio.as_completed([solve(i) for i in batch]):
+                group, found = await coro
                 stats["scans"] += 1
                 if state is not None:
                     state.scans = stats["scans"]

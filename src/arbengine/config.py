@@ -54,6 +54,22 @@ class Settings(BaseSettings):
     # once back-dated by its cache age.
     max_quote_age_sec: int = 30
 
+    # ── Stream scanning ───────────────────────────────────────────────────────
+    # How often dirty groups are re-solved. This is a FLOOR on the lifetime of a
+    # violation the engine can see: anything that appears and vanishes inside
+    # one interval is missed.
+    #
+    # The right value depends entirely on the workload. A multi-leg intra-venue
+    # LP on a 188-leg group takes ~58ms, so a 25ms cadence is not physically
+    # possible there on one core. A cross-venue pair check is O(1) arithmetic on
+    # two quotes and can run at 25ms comfortably — which is why vendors quoting
+    # a 25ms debounce are describing pairwise checks, not a multi-leg solve.
+    scan_interval_sec: float = 0.25
+    # Threads used to solve dirty groups concurrently. scipy releases the GIL in
+    # its compiled paths, so this scales with physical cores. Raise it on a
+    # many-core host; the LP is CPU-bound and does not use a GPU.
+    scan_workers: int = 4
+
     # ── Rate limiting ─────────────────────────────────────────────────────────
     # Kalshi meters by token cost against a continuously refilling budget.
     # Per-second Read budgets by tier: basic 200, advanced 300, expert 600,

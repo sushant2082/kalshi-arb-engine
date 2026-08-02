@@ -43,6 +43,16 @@ def _client(settings: Settings, key) -> KalshiClient:
 
 
 def _setup_logging(verbose: bool) -> None:
+    # Python fully buffers stdout when it is not a tty, so a long run whose
+    # output is redirected to a file writes nothing for minutes and looks hung.
+    # That matters here: these are hour-plus scans, usually redirected, often
+    # on a remote host where "no output" is indistinguishable from "crashed".
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
+
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",

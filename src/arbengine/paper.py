@@ -20,7 +20,7 @@ from datetime import datetime
 
 import numpy as np
 
-from arbengine.fees import fee_per_contract
+from arbengine.fees import order_fee
 from arbengine.models import (
     ArbOpportunity,
     ContractGroup,
@@ -95,7 +95,8 @@ class PaperBroker:
                     requested_qty=requested,
                     filled_qty=filled,
                     price=price,
-                    fee=fee_per_contract(price, self.fee_multiplier),
+                    # Charged once for the filled order, not per contract.
+                    fee=order_fee(price, filled, self.fee_multiplier),
                 )
             )
 
@@ -119,7 +120,7 @@ class PaperBroker:
             sets_filled = 0
 
         self.bankroll += net_cash
-        total_fee = sum(f.fee * f.filled_qty for f in fills)
+        total_fee = sum(f.fee for f in fills)
 
         if fill_status == "broken":
             log.warning(

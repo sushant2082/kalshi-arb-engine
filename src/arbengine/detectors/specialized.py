@@ -16,7 +16,7 @@ from datetime import datetime
 
 import numpy as np
 
-from arbengine.fees import fee_per_contract
+from arbengine.fees import order_fee
 from arbengine.models import ArbOpportunity, Contract, ContractGroup, Leg
 
 log = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ def _mk(
     fillable_sets: int,
     now: datetime,
 ) -> ArbOpportunity:
-    total_fee = sum(leg.fee * leg.qty for leg in legs)
+    total_fee = sum(leg.fee for leg in legs)
     total_cost = -sum(leg.cash_flow for leg in legs)
     return ArbOpportunity(
         group_id=group_id,
@@ -74,25 +74,24 @@ def detect_complement(
     if not (_buyable(yes) and _buyable(no)):
         return None
 
-    fee_yes = fee_per_contract(yes.ask, fee_multiplier)
-    fee_no = fee_per_contract(no.ask, fee_multiplier)
-    cost_per_set = yes.ask + fee_yes + no.ask + fee_no
-    profit_per_set = 1.0 - cost_per_set
-
-    if profit_per_set <= min_profit:
-        return None
-
     sets = min(yes.ask_size, no.ask_size)
     if sets <= 0:
+        return None
+
+    # Fees are charged once per order, so they must be computed at the actual
+    # size rather than per contract and scaled up.
+    fee_yes = order_fee(yes.ask, sets, fee_multiplier)
+    fee_no = order_fee(no.ask, sets, fee_multiplier)
+    total_profit = sets * (1.0 - yes.ask - no.ask) - fee_yes - fee_no
+
+    if total_profit <= min_profit * sets:
         return None
 
     legs = [
         Leg(ticker=yes.ticker, side="buy", qty=sets, price=yes.ask, fee=fee_yes),
         Leg(ticker=no.ticker, side="buy", qty=sets, price=no.ask, fee=fee_no),
     ]
-    return _mk(
-        yes.ticker, "complement", legs, profit_per_set * sets, sets, now,
-    )
+    return _mk(yes.ticker, "complement", legs, total_profit, sets, now)
 
 
 # ── Partition ─────────────────────────────────────────────────────────────────
@@ -126,24 +125,21 @@ def detect_partition(
     if not np.all(col_sums == 1):
         return None
 
-    fees = [fee_per_contract(c.ask, fee_multiplier) for c in contracts]
-    cost_per_set = sum(c.ask for c in contracts) + sum(fees)
-    profit_per_set = 1.0 - cost_per_set
-
-    if profit_per_set <= min_profit:
-        return None
-
     sets = min(c.ask_size for c in contracts)
     if sets <= 0:
+        return None
+
+    fees = [order_fee(c.ask, sets, fee_multiplier) for c in contracts]
+    total_profit = sets * (1.0 - sum(c.ask for c in contracts)) - sum(fees)
+
+    if total_profit <= min_profit * sets:
         return None
 
     legs = [
         Leg(ticker=c.ticker, side="buy", qty=sets, price=c.ask, fee=f)
         for c, f in zip(contracts, fees)
     ]
-    return _mk(
-        group.group_id, "partition", legs, profit_per_set * sets, sets, now,
-    )
+    return _mk(group.group_id, "partition", legs, total_profit, sets, now)
 
 
 # ── Monotonic ladder (implication) ────────────────────────────────────────────
@@ -190,15 +186,15 @@ def detect_monotonic(
             if not (_sellable(a) and _buyable(b)):
                 continue
 
-            fee_sell = fee_per_contract(a.bid, fee_multiplier)
-            fee_buy = fee_per_contract(b.ask, fee_multiplier)
-            credit_per_set = (a.bid - fee_sell) - (b.ask + fee_buy)
-
-            if credit_per_set <= min_profit:
-                continue
-
             sets = min(a.bid_size, b.ask_size)
             if sets <= 0:
+                continue
+
+            fee_sell = order_fee(a.bid, sets, fee_multiplier)
+            fee_buy = order_fee(b.ask, sets, fee_multiplier)
+            total_profit = sets * (a.bid - b.ask) - fee_sell - fee_buy
+
+            if total_profit <= min_profit * sets:
                 continue
 
             legs = [
@@ -206,10 +202,7 @@ def detect_monotonic(
                 Leg(ticker=a.ticker, side="sell", qty=sets, price=a.bid, fee=fee_sell),
             ]
             found.append(
-                _mk(
-                    group.group_id, type_, legs,
-                    credit_per_set * sets, sets, now,
-                )
+                _mk(group.group_id, type_, legs, total_profit, sets, now)
             )
 
     return found

@@ -17,7 +17,7 @@ from datetime import datetime
 import numpy as np
 from scipy.optimize import linprog
 
-from arbengine.fees import buy_cost, fee_per_contract, sell_proceeds
+from arbengine.fees import ROUNDING_HEADROOM, buy_cost, order_fee, sell_proceeds
 from arbengine.models import ArbOpportunity, ContractGroup, Leg
 
 log = logging.getLogger(__name__)
@@ -167,8 +167,9 @@ def _integerize(
     buys: np.ndarray,
     sells: np.ndarray,
     payoff: np.ndarray,
-    buy_costs: np.ndarray,
-    sell_proceeds_arr: np.ndarray,
+    asks: list,
+    bids: list,
+    fee_multiplier: float,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Kalshi trades whole contracts, so the LP's continuous solution has to be
@@ -185,7 +186,19 @@ def _integerize(
 
     net = int_buys - int_sells
     terminal = payoff.T @ net  # value in each state
-    cash_out = float(buy_costs @ int_buys - sell_proceeds_arr @ int_sells)
+
+    # Price the floored portfolio with EXACT per-order fees rather than the
+    # linearized rate the LP optimized against. The LP has to be linear, but the
+    # number reported to the caller should be what Kalshi would actually charge.
+    cash_out = 0.0
+    for i in range(len(int_buys)):
+        qty = int(int_buys[i])
+        if qty > 0 and asks[i] is not None:
+            cash_out += asks[i] * qty + order_fee(asks[i], qty, fee_multiplier)
+        qty = int(int_sells[i])
+        if qty > 0 and bids[i] is not None:
+            cash_out -= bids[i] * qty - order_fee(bids[i], qty, fee_multiplier)
+
     worst = float(np.min(terminal)) - cash_out if terminal.size else -cash_out
 
     return int_buys, int_sells, worst
@@ -230,7 +243,7 @@ def detect_lp(
             sell_proceeds_arr[i] = sell_proceeds(c.bid, fee_multiplier)
 
     int_buys, int_sells, worst = _integerize(
-        buys, sells, payoff, buy_costs, sell_proceeds_arr
+        buys, sells, payoff, asks, bids, fee_multiplier
     )
 
     if worst <= max(min_profit, tolerance):
@@ -246,21 +259,23 @@ def detect_lp(
             legs.append(
                 Leg(
                     ticker=c.ticker, side="buy", qty=int(int_buys[i]),
-                    price=c.ask, fee=fee_per_contract(c.ask, fee_multiplier),
+                    price=c.ask,
+                    fee=order_fee(c.ask, int(int_buys[i]), fee_multiplier),
                 )
             )
         if int_sells[i] > 0:
             legs.append(
                 Leg(
                     ticker=c.ticker, side="sell", qty=int(int_sells[i]),
-                    price=c.bid, fee=fee_per_contract(c.bid, fee_multiplier),
+                    price=c.bid,
+                    fee=order_fee(c.bid, int(int_sells[i]), fee_multiplier),
                 )
             )
 
     if not legs:
         return None
 
-    total_fee = sum(leg.fee * leg.qty for leg in legs)
+    total_fee = sum(leg.fee for leg in legs)
     total_cost = -sum(leg.cash_flow for leg in legs)
 
     # "Fillable sets" for an LP portfolio is not a clean multiple the way a

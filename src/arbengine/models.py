@@ -104,14 +104,18 @@ class Leg(BaseModel):
     side: Side
     qty: int
     price: float  # ask if buying, bid if selling
-    fee: float    # per-contract fee at `price`
+    # TOTAL fee for this leg's whole order, not per contract. Kalshi rounds up
+    # once per order, so a per-contract fee multiplied by quantity overcharges
+    # by up to 25x on sub-penny legs — which is most legs in a wide bracket set.
+    fee: float
 
     @property
     def cash_flow(self) -> float:
         """Negative when buying (cash out), positive when selling (cash in)."""
+        gross = self.price * self.qty
         if self.side == "buy":
-            return -(self.price + self.fee) * self.qty
-        return (self.price - self.fee) * self.qty
+            return -(gross + self.fee)
+        return gross - self.fee
 
 
 class ArbOpportunity(BaseModel):
@@ -171,13 +175,14 @@ class PaperFill(BaseModel):
     requested_qty: int
     filled_qty: int
     price: float  # effective price after simulated slippage
-    fee: float
+    fee: float    # TOTAL fee for the filled quantity, not per contract
 
     @property
     def cash_flow(self) -> float:
+        gross = self.price * self.filled_qty
         if self.side == "buy":
-            return -(self.price + self.fee) * self.filled_qty
-        return (self.price - self.fee) * self.filled_qty
+            return -(gross + self.fee)
+        return gross - self.fee
 
 
 class PaperPosition(BaseModel):

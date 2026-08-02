@@ -13,7 +13,7 @@ import numpy as np
 
 from arbengine.detectors.lp import detect_lp
 from arbengine.detectors.specialized import run_specialized
-from arbengine.fees import fee_per_contract
+from arbengine.fees import linear_fee_rate, order_fee
 from arbengine.groups import (
     build_group,
     contract_from_market,
@@ -372,8 +372,10 @@ def near_miss(group: ContractGroup, settings: Settings) -> dict:
                 continue
             if a.bid is None or b.ask is None or a.bid_size <= 0 or b.ask_size <= 0:
                 continue
-            margin = (a.bid - fee_per_contract(a.bid, fee_mult)) - (
-                b.ask + fee_per_contract(b.ask, fee_mult)
+            # Marginal (unrounded) rate: this is "how far from inverting per
+            # additional contract", so the per-order ceiling does not belong.
+            margin = (a.bid - linear_fee_rate(a.bid, fee_mult)) - (
+                b.ask + linear_fee_rate(b.ask, fee_mult)
             )
             if best_mono is None or margin > best_mono:
                 best_mono = margin
@@ -384,7 +386,7 @@ def near_miss(group: ContractGroup, settings: Settings) -> dict:
     ):
         if np.all(payoff.sum(axis=0) == 1):
             partition_cost = sum(
-                c.ask + fee_per_contract(c.ask, fee_mult) for c in contracts
+                c.ask + linear_fee_rate(c.ask, fee_mult) for c in contracts
             )
 
     return {

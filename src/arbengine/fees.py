@@ -2,15 +2,32 @@ import math
 
 DEFAULT_FEE_MULTIPLIER = 0.07
 
+# VERIFIED against the Kalshi Fee Schedule effective 2026-07-07:
+#
+#     taker: fees = round_up(M x 0.07   x C x P x (1-P))
+#     maker: fees = round_up(M x 0.0175 x C x P x (1-P))
+#
+# M is a per-series multiplier, default 1 for takers and 0 for makers. Series
+# listed with M=0 (KXBTCY, KXETHY, KXDOED, ...) are genuinely fee-free, which
+# the /series API also reports as fee_multiplier.
+MAKER_FEE_MULTIPLIER = 0.0175
+
 # Granularity the per-order fee is rounded UP to.
 #
-# docs.kalshi.com/getting_started/fee_rounding (read 2026-08-02) states the fee
-# is "rounded up to the nearest $0.0001 (centicent)" and that the accumulator is
-# maintained PER ORDER across fills — not per contract. The older widely-quoted
-# form rounds to the nearest cent. The difference is at most $0.0099 per order,
-# so it is minor next to the per-contract bug, but rounding to the cent when
-# Kalshi rounds to the centicent overstates fees on every single leg.
-FEE_ROUNDING = 0.0001
+# The sources disagree and the difference is worth stating plainly:
+#
+#   - The schedule's formula and docs.kalshi.com/getting_started/fee_rounding
+#     both say the rounding is to a centicent ($0.0001).
+#   - The schedule's own published fee TABLE matches cent rounding exactly on
+#     all 21 rows, and does not match centicent rounding on 10 of them (e.g.
+#     100 @ $0.05 is listed at $0.34 where the raw fee is $0.3325).
+#
+# Defaulting to the cent is the conservative reading: it can only overstate
+# fees. Understating them is the one error that turns a loss into a reported
+# arbitrage, and this engine exists to not do that. Set FEE_ROUNDING=0.0001 to
+# take the formula's reading once the discrepancy is settled — it makes
+# marginal opportunities slightly easier to clear.
+FEE_ROUNDING = 0.01
 
 
 def order_fee(

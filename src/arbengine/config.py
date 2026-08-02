@@ -17,9 +17,15 @@ class Settings(BaseSettings):
     kalshi_ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 
     # ── Fee model ──────────────────────────────────────────────────────────────
-    # fee(P) = ceil(multiplier * P * (1-P) * 100) / 100
-    # VERIFY this multiplier against current Kalshi docs per market category.
+    # VERIFIED against the Kalshi Fee Schedule effective 2026-07-07:
+    #   taker: fees = round_up(M x 0.07 x C x P x (1-P))
+    # M is a per-series multiplier read live from /series; series with M=0
+    # (KXBTCY, KXETHY, ...) are genuinely fee-free.
     fee_multiplier: float = 0.07
+    # Rounding granularity. The published formula says centicent; the published
+    # fee TABLE matches cent exactly. Cent is the conservative reading and can
+    # only overstate fees — see fees.FEE_ROUNDING.
+    fee_rounding: float = 0.01
 
     # ── Detection thresholds ───────────────────────────────────────────────────
     # Minimum guaranteed profit t* (dollars, whole portfolio) required to flag.

@@ -8,12 +8,12 @@ from arbengine.fees import buy_cost, fee_per_contract, sell_proceeds
 @pytest.mark.parametrize(
     "price, expected",
     [
-        # fee = roundup(0.07 * C * P * (1-P), to $0.0001), C = 1
-        (0.50, 0.0175),  # 0.07*0.25 = 0.0175 exactly
-        (0.20, 0.0112),  # 0.07*0.16 = 0.0112
-        (0.90, 0.0063),  # 0.07*0.09 = 0.0063
-        (0.00, 0.0000),  # no fee at the boundaries
-        (1.00, 0.0000),
+        # Single-contract column of the official fee schedule (2026-07-07).
+        (0.50, 0.02),
+        (0.20, 0.02),
+        (0.90, 0.01),
+        (0.00, 0.00),   # no fee at the boundaries
+        (1.00, 0.00),
     ],
 )
 def test_known_fee_values(price: float, expected: float) -> None:
@@ -31,11 +31,49 @@ def test_fee_peaks_at_one_half() -> None:
         assert fee_per_contract(p) <= peak
 
 
-def test_fee_always_lands_on_a_centicent() -> None:
-    """Kalshi rounds the per-order fee up to $0.0001, not to the cent."""
+def test_fee_lands_on_the_configured_granularity() -> None:
+    from arbengine.fees import FEE_ROUNDING
+
     for i in range(0, 101):
         fee = fee_per_contract(i / 100)
-        assert math.isclose(fee * 10_000, round(fee * 10_000), abs_tol=1e-6)
+        steps = fee / FEE_ROUNDING
+        assert math.isclose(steps, round(steps), abs_tol=1e-6)
+
+
+OFFICIAL_100_CONTRACT_FEES = {
+    0.01: 0.07, 0.05: 0.34, 0.10: 0.63, 0.15: 0.90, 0.20: 1.12,
+    0.25: 1.32, 0.30: 1.47, 0.35: 1.60, 0.40: 1.68, 0.45: 1.74,
+    0.50: 1.75, 0.55: 1.74, 0.60: 1.68, 0.65: 1.60, 0.70: 1.47,
+    0.75: 1.32, 0.80: 1.12, 0.85: 0.90, 0.90: 0.63, 0.95: 0.34,
+    0.99: 0.07,
+}
+
+
+@pytest.mark.parametrize("price, expected", sorted(OFFICIAL_100_CONTRACT_FEES.items()))
+def test_matches_official_fee_schedule_table(price: float, expected: float) -> None:
+    """
+    Every row of the published 100-contract fee table, effective 2026-07-07.
+    This is the ground truth the whole engine's profitability math rests on.
+    """
+    from arbengine.fees import order_fee
+
+    assert order_fee(price, 100) == pytest.approx(expected, abs=1e-9)
+
+
+def test_maker_fee_is_a_quarter_of_taker() -> None:
+    """
+    Maker is 0.0175 vs taker 0.07. Recorded because it bounds what a resting
+    strategy would pay — this engine models taker fills, which is the
+    expensive side, since an arbitrage leg has to execute immediately.
+    """
+    from arbengine.fees import MAKER_FEE_MULTIPLIER, linear_fee_rate
+
+    # Compare the unrounded rates: rounding to the cent breaks the exact
+    # ratio at any particular size.
+    taker = linear_fee_rate(0.5, 0.07)
+    maker = linear_fee_rate(0.5, MAKER_FEE_MULTIPLIER)
+    assert maker == pytest.approx(taker / 4, rel=1e-9)
+    assert MAKER_FEE_MULTIPLIER == 0.0175
 
 
 def test_rounding_is_always_upward() -> None:
@@ -77,33 +115,31 @@ def test_fee_rounds_once_per_order_not_per_contract() -> None:
     """
     from arbengine.fees import order_fee
 
-    # 100 at $0.005: 0.07 * 100 * 0.005 * 0.995 = $0.034825 -> $0.0349
-    assert order_fee(0.005, 100) == pytest.approx(0.0349, abs=1e-9)
-    # Per-contract scaling never undercharges, and here it overcharges.
-    assert fee_per_contract(0.005) * 100 > order_fee(0.005, 100)
+    # 100 at $0.005: 0.07 * 100 * 0.005 * 0.995 = $0.034825 -> $0.04
+    assert order_fee(0.005, 100) == pytest.approx(0.04, abs=1e-9)
+    # Per-contract scaling pays the rounding penalty 100 times over.
+    assert fee_per_contract(0.005) * 100 == pytest.approx(1.00)
 
 
-def test_cent_rounding_is_what_made_the_old_bug_catastrophic() -> None:
+def test_rounding_granularity_drives_the_size_of_the_old_bug() -> None:
     """
     Pins the interaction between the two fee errors, because the magnitude of
     the first depends entirely on the second.
 
-    Rounding per contract is wrong at any granularity, but it is merely
-    imprecise at centicent granularity and catastrophic at cent granularity: a
-    $0.005 contract owes $0.0004 and rounds to a full cent standalone, so
-    scaling it charged 25x. Sub-penny legs are most of a wide bracket set, so
-    that error is what suppressed detection.
+    Rounding per contract is wrong at any granularity, but at cent granularity
+    it is catastrophic: a $0.005 contract owes $0.0003 and rounds to a full
+    cent standalone, so scaling it charged 25x. Sub-penny legs are most of a
+    wide bracket set, which is why it suppressed detection outright.
     """
     from arbengine.fees import order_fee
 
-    cent_per_contract = order_fee(0.005, 1, rounding=0.01) * 100
-    true_fee = order_fee(0.005, 100)
-    assert cent_per_contract == pytest.approx(1.00)
-    assert cent_per_contract / true_fee > 25
+    cent_scaled = order_fee(0.005, 1, rounding=0.01) * 100
+    assert cent_scaled == pytest.approx(1.00)
+    assert cent_scaled / order_fee(0.005, 100, rounding=0.01) == pytest.approx(25.0)
 
-    # At the documented centicent granularity the same mistake is ~1.1x.
-    centicent_per_contract = order_fee(0.005, 1) * 100
-    assert 1.0 < centicent_per_contract / true_fee < 1.5
+    # At centicent granularity the same mistake is only ~1.1x.
+    cc_scaled = order_fee(0.005, 1, rounding=0.0001) * 100
+    assert 1.0 < cc_scaled / order_fee(0.005, 100, rounding=0.0001) < 1.5
 
 
 def test_order_fee_of_one_matches_fee_per_contract() -> None:

@@ -286,19 +286,30 @@ async def stream_scan(
     on_opportunity,
     stop_after_sec: float | None = None,
     state=None,
+    scan_interval_sec: float = 0.25,
 ) -> dict:
     """
-    Event-driven scan: re-check a group the instant any of its legs moves.
+    Event-driven scan: apply book updates immediately, scan on a bounded cadence.
 
-    REST polling at N seconds cannot see a violation that lives for less than N
-    seconds, and the fee arithmetic says the only violations that survive fees
-    are the fast ones. So the poll loop measures persistence honestly but
-    systematically undercounts opportunities; this path is what makes the count
-    meaningful.
+    The naive design — scan the affected group inline on every book update —
+    does not survive contact with a real feed. A 188-leg group takes ~58ms to
+    solve, so one thread sustains about 17 updates a second while the feed
+    delivers nearer 200. The event loop saturates, websocket pings go
+    unanswered, and Kalshi drops the connection on a keepalive timeout. Measured
+    over 40 minutes that cost roughly 97% of the feed.
 
-    Groups are re-scanned per update rather than on a timer because a lock
-    exists only while every leg holds its quote — batching updates would report
-    portfolios assembled from quotes that never coexisted.
+    Two changes fix it:
+
+    1. COALESCE. When 188 legs of one group tick, the naive loop runs 188
+       identical scans of the same group. Updates are applied immediately (cheap
+       model copies) and the group is marked dirty; a worker scans dirty groups
+       on a fixed cadence. The tradeoff is real and worth stating: a violation
+       that appears and vanishes entirely within one interval is missed. That is
+       a far better trade than dropping the connection, but it does mean
+       `scan_interval_sec` is a floor on detectable lifetime.
+
+    2. OFFLOAD. The LP runs in a worker thread so the event loop stays free to
+       answer pings while scipy is busy.
     """
     ticker_to_groups: dict[str, list[int]] = {}
     for idx, g in enumerate(groups):
@@ -308,44 +319,63 @@ async def stream_scan(
     tickers = sorted(ticker_to_groups)
     queue: asyncio.Queue = asyncio.Queue()
     live = list(groups)
+    dirty: set[int] = set()
 
     producer = asyncio.create_task(client.stream_books(tickers, queue))
     started = time.monotonic()
-    stats = {"updates": 0, "scans": 0, "opportunities": 0}
+    stats = {"updates": 0, "scans": 0, "opportunities": 0, "coalesced": 0}
+    stop = asyncio.Event()
 
-    try:
-        while True:
-            if stop_after_sec is not None:
-                remaining = stop_after_sec - (time.monotonic() - started)
-                if remaining <= 0:
-                    break
-                try:
-                    ticker, book, ts = await asyncio.wait_for(
-                        queue.get(), timeout=remaining
-                    )
-                except asyncio.TimeoutError:
-                    break
-            else:
-                ticker, book, ts = await queue.get()
-
+    async def consume() -> None:
+        """Apply quotes as fast as they arrive. Never blocks on the LP."""
+        while not stop.is_set():
+            try:
+                ticker, book, ts = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
             stats["updates"] += 1
             if state is not None:
                 state.updates = stats["updates"]
-
             for idx in ticker_to_groups.get(ticker, ()):
                 live[idx] = apply_quote(live[idx], ticker, book, ts)
-                found = scan_group(live[idx], settings, ts)
+                dirty.add(idx)
+
+    async def scan_worker() -> None:
+        while not stop.is_set():
+            await asyncio.sleep(scan_interval_sec)
+            if not dirty:
+                continue
+            batch = sorted(dirty)
+            dirty.clear()
+            now = datetime.now(timezone.utc)
+            for idx in batch:
+                group = live[idx]
+                # scipy blocks; keep it off the loop so pings still get answered.
+                found = await asyncio.to_thread(scan_group, group, settings, now)
                 stats["scans"] += 1
                 if state is not None:
                     state.scans = stats["scans"]
                 for opp in found:
                     stats["opportunities"] += 1
-                    await on_opportunity(opp, live[idx])
-    finally:
-        producer.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await producer
+                    await on_opportunity(opp, group)
 
+    consumer = asyncio.create_task(consume())
+    scanner = asyncio.create_task(scan_worker())
+
+    try:
+        if stop_after_sec is not None:
+            await asyncio.sleep(stop_after_sec)
+        else:
+            await asyncio.Event().wait()
+    finally:
+        stop.set()
+        for task in (producer, consumer, scanner):
+            task.cancel()
+        for task in (producer, consumer, scanner):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    stats["coalesced"] = max(0, stats["updates"] - stats["scans"])
     return stats
 
 

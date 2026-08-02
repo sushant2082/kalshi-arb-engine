@@ -12,6 +12,26 @@ class Settings(BaseSettings):
     kalshi_api_key_id: str = Field(default="")
     kalshi_private_key_path: Path = Field(default=Path("kalshi_key.pem"))
 
+    # ── Sharp odds source (value betting only, not arbitrage) ─────────────────
+    odds_api_key: str = Field(default="")
+    odds_base_url: str = "https://api.the-odds-api.com/v4"
+    # Pinnacle sits in the EU region on The Odds API. Their docs note the odds
+    # are scraped from the public site and may lag, which is tolerable pregame
+    # and disqualifying in-play.
+    odds_regions: str = "eu,us"
+    sharp_books: Annotated[list[str], NoDecode] = ["pinnacle"]
+    devig_method: str = "shin"
+    # Minimum edge AFTER fees. Kalshi costs ~1.75c per contract at mid prices,
+    # so this sits above the fee rather than at it: an edge that only just
+    # clears costs is noise in the devig method, not signal.
+    min_net_edge: float = 0.02
+    # A sharp line and a Kalshi price captured further apart than this are
+    # measuring the market's movement, not an edge.
+    max_quote_skew_sec: float = 60.0
+    kelly_multiplier: float = 0.25
+    max_stake_fraction: float = 0.05
+    odds_poll_sec: int = 60
+
     # ── Endpoints ──────────────────────────────────────────────────────────────
     kalshi_base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
     kalshi_ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
@@ -120,6 +140,13 @@ class Settings(BaseSettings):
     paper_leg_fill_prob: float = 1.0
     # Extra adverse price movement per leg, in cents, applied on entry.
     paper_slippage_cents: float = 0.0
+
+    @field_validator("sharp_books", mode="before")
+    @classmethod
+    def _split_books(cls, v: object) -> object:
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        return v
 
     @field_validator("target_series", mode="before")
     @classmethod

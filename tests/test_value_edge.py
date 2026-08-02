@@ -189,3 +189,36 @@ def test_summary_reports_the_expected_loss_rate() -> None:
 
 def test_empty_summary_is_safe() -> None:
     assert summarize_expectations([])["count"] == 0
+
+
+# ── The in-progress guard ─────────────────────────────────────────────────────
+
+def test_started_games_are_rejected_outright() -> None:
+    """
+    The most dangerous failure in this strategy. Kalshi prices a live game on
+    its current state while the sharp feed is pregame, so after first pitch a
+    team losing badly reads as a huge edge. Measured live, every apparent edge
+    above 9% came from an in-progress game.
+    """
+    q = _quote(0.52, 0.52)
+    q.commence_time = NOW - timedelta(minutes=40)
+    home, _ = fair_probabilities(q)
+    side = _side(ask=home - 0.20)
+    assert evaluate(side, q, home, bankroll=10_000, now=NOW) is None
+
+
+def test_games_about_to_start_are_rejected() -> None:
+    """Too close to first pitch is the same problem with less warning."""
+    q = _quote(0.52, 0.52)
+    q.commence_time = NOW + timedelta(minutes=2)
+    home, _ = fair_probabilities(q)
+    assert evaluate(_side(ask=home - 0.20), q, home,
+                    bankroll=10_000, now=NOW, min_minutes_to_start=5) is None
+
+
+def test_pregame_edges_still_qualify() -> None:
+    q = _quote(0.52, 0.52)
+    q.commence_time = NOW + timedelta(hours=3)
+    home, _ = fair_probabilities(q)
+    opp = evaluate(_side(ask=home - 0.10), q, home, bankroll=10_000, now=NOW)
+    assert opp is not None

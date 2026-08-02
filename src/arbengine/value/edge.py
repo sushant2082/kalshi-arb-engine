@@ -166,6 +166,8 @@ def evaluate(
     min_net_edge: float = 0.02,
     max_quote_skew_sec: float = 60.0,
     max_stake_fraction: float = 0.05,
+    now: datetime | None = None,
+    min_minutes_to_start: float = 5.0,
 ) -> ValueOpportunity | None:
     """
     Score one Kalshi side against a sharp line.
@@ -177,6 +179,23 @@ def evaluate(
     negative-EV one.
     """
     warnings: list[str] = []
+
+    # HARD REJECT: the game must not have started.
+    #
+    # This is the single most dangerous failure mode in the strategy. Kalshi
+    # prices a live game on its current state, while The Odds API serves
+    # Pinnacle's pregame line (and notes it may lag). Compare the two after
+    # first pitch and a team losing 5-0 looks like a 20-point "edge" — the
+    # largest and most confident-looking signals the scanner can produce, all
+    # of them just the game having already happened.
+    #
+    # Measured live: every apparent edge above 9% came from an in-progress
+    # game, while genuinely pregame matchups agreed with Pinnacle to under 1%.
+    reference = now or side.fetched_at
+    if quote.commence_time is not None:
+        minutes_out = (quote.commence_time - reference).total_seconds() / 60.0
+        if minutes_out < min_minutes_to_start:
+            return None
 
     skew = abs((side.fetched_at - quote.fetched_at).total_seconds())
     if skew > max_quote_skew_sec:

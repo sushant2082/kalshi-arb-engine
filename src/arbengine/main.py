@@ -553,6 +553,26 @@ async def _run_sxbet(settings: Settings, duration_sec: float | None) -> None:
         )
 
 
+async def _run_crossmlb(
+    settings: Settings, duration_sec: float | None, interval_sec: float
+) -> None:
+    """Live Kalshi <-> Polymarket MLB monitor."""
+    from arbengine.crossmon import monitor
+
+    key = load_private_key(settings.kalshi_private_key_path)
+    async with _client(settings, key) as client:
+        stats = await monitor(
+            client,
+            duration_sec=duration_sec or 300.0,
+            interval_sec=interval_sec,
+            fee_multiplier=settings.fee_multiplier,
+        )
+    print(
+        f"\n{stats['ticks']} snapshots over {stats['games']} shared games; "
+        f"{stats['arbs']} game-ticks showed a cross below $1.\n"
+    )
+
+
 def _make_broker(settings: Settings) -> PaperBroker | None:
     if not settings.paper_enabled:
         return None
@@ -692,18 +712,23 @@ def run() -> None:
     )
     parser.add_argument(
         "command", nargs="?", default="scan",
-        choices=["scan", "stream", "discover", "backtest", "demo", "sxbet"],
+        choices=["scan", "stream", "discover", "backtest", "demo", "sxbet", "crossmlb"],
         help=(
             "scan: REST polling loop. stream: event-driven WebSocket scan. "
             "discover: list candidate series. backtest: verify locks end to "
             "end on live geometry. demo: watch paper trading run against "
             "synthetic dislocations. sxbet: scan SX Bet for zero-fee "
-            "within-market locks."
+            "within-market locks. crossmlb: live Kalshi vs Polymarket MLB "
+            "price monitor."
         ),
     )
     parser.add_argument(
         "--duration", type=float, default=None,
         help="stream only: stop after N seconds",
+    )
+    parser.add_argument(
+        "--interval", type=float, default=30.0,
+        help="crossmlb only: seconds between snapshots",
     )
     parser.add_argument(
         "--ui", action="store_true",
@@ -732,6 +757,8 @@ def run() -> None:
             asyncio.run(_run_demo(settings, args.duration or 60.0))
         elif args.command == "sxbet":
             asyncio.run(_run_sxbet(settings, args.duration))
+        elif args.command == "crossmlb":
+            asyncio.run(_run_crossmlb(settings, args.duration, args.interval))
         else:
             asyncio.run(_run_scan(settings, args.once, args.iterations))
     except KeyboardInterrupt:

@@ -188,6 +188,44 @@ class PolymarketClient:
             if m.get("enableOrderBook") and m.get("acceptingOrders")
         ]
 
+    async def markets_by_tag(
+        self, tag_slug: str, max_pages: int = 15
+    ) -> list[dict]:
+        """
+        Every market under a league tag, via the EVENTS endpoint.
+
+        The volume-ordered /markets sweep buries per-game moneylines beneath
+        thousands of higher-volume markets — a 30-page sweep surfaced only two
+        MLB games out of ninety-six. Tag filtering works on /events but not on
+        /markets, so games are collected from the events payload instead.
+        """
+        out: dict[str, dict] = {}
+        for page in range(max_pages):
+            try:
+                events = await self._get(
+                    f"{GAMMA_BASE}/events",
+                    params={
+                        "limit": self.PAGE_SIZE,
+                        "offset": page * self.PAGE_SIZE,
+                        "closed": "false",
+                        "tag_slug": tag_slug,
+                    },
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 422:
+                    break
+                raise
+            if not events:
+                break
+            for ev in events:
+                for m in ev.get("markets") or []:
+                    slug = m.get("slug")
+                    if slug:
+                        out[slug] = m
+            if len(events) < self.PAGE_SIZE:
+                break
+        return list(out.values())
+
     async def get_book(self, token_id: str) -> dict:
         data = await self._get(f"{CLOB_BASE}/book", params={"token_id": token_id})
         return parse_clob_book(data)

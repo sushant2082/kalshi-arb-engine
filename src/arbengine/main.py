@@ -573,6 +573,29 @@ async def _run_crossmlb(
     )
 
 
+async def _run_crosslive(
+    settings: Settings, duration_sec: float | None, interval_sec: float
+) -> None:
+    """Live cross-venue monitor on uncached endpoints, in-progress games only."""
+    from arbengine.crossmon import monitor_live
+
+    key = load_private_key(settings.kalshi_private_key_path)
+    async with _client(settings, key) as client:
+        stats = await monitor_live(
+            client,
+            duration_sec=duration_sec or 300.0,
+            interval_sec=interval_sec if interval_sec != 30.0 else 5.0,
+            fee_multiplier=settings.fee_multiplier,
+        )
+    print(
+        f"\n{stats['ticks']} reads over {stats['games']} in-progress games; "
+        f"{stats['crosses']} crosses seen."
+    )
+    if stats["best"] is not None:
+        print(f"largest fillable cross: ${stats['best']:.2f}")
+    print()
+
+
 def _make_broker(settings: Settings) -> PaperBroker | None:
     if not settings.paper_enabled:
         return None
@@ -712,7 +735,8 @@ def run() -> None:
     )
     parser.add_argument(
         "command", nargs="?", default="scan",
-        choices=["scan", "stream", "discover", "backtest", "demo", "sxbet", "crossmlb"],
+        choices=["scan", "stream", "discover", "backtest", "demo", "sxbet",
+                 "crossmlb", "crosslive"],
         help=(
             "scan: REST polling loop. stream: event-driven WebSocket scan. "
             "discover: list candidate series. backtest: verify locks end to "
@@ -759,6 +783,8 @@ def run() -> None:
             asyncio.run(_run_sxbet(settings, args.duration))
         elif args.command == "crossmlb":
             asyncio.run(_run_crossmlb(settings, args.duration, args.interval))
+        elif args.command == "crosslive":
+            asyncio.run(_run_crosslive(settings, args.duration, args.interval))
         else:
             asyncio.run(_run_scan(settings, args.once, args.iterations))
     except KeyboardInterrupt:

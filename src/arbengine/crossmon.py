@@ -31,6 +31,65 @@ async def collect_pairs(kalshi_client, pm_client: PolymarketClient):
     return pairs, rejects, {m["ticker"]: m for m in kalshi_markets}
 
 
+async def live_snapshot(
+    kalshi_client,
+    pm_client: PolymarketClient,
+    pairs: list,
+    fee_multiplier: float = 0.07,
+) -> list[CrossQuote]:
+    """
+    Fetch prices from the UNCACHED endpoints on both venues.
+
+    This is the only path that can tell a real divergence from a stale one.
+    Measured cache behaviour:
+
+        Kalshi /markets                    Cache-Control max-age=15  (Age 1->13)
+        Kalshi /markets/{t}/orderbook      no Age, X-Cache Miss  <- live
+        Polymarket gamma /markets          Cache-Control max-age=300 (!)
+        Polymarket CLOB /book              no Age, no Cache-Control  <- live
+
+    The poll monitor compared a 15-second-stale Kalshi price against a current
+    Polymarket one, which on a fast-moving live game manufactures exactly the
+    kind of double-digit cross that then vanishes on the next tick. Gamma is
+    worse still at five minutes, so it is used only for discovery, never for
+    prices.
+    """
+    now = datetime.now(timezone.utc)
+
+    tickers: list[str] = []
+    tokens: list[str] = []
+    for p in pairs:
+        for slug in (p.away_slug, p.home_slug):
+            tk = p.kalshi_tickers.get(slug)
+            if tk:
+                tickers.append(tk)
+            tid = p.pm.token_for_slug(slug)
+            if tid:
+                tokens.append(tid)
+
+    books_k, books_p = await asyncio.gather(
+        kalshi_client.get_books(tickers),
+        pm_client.get_books(tokens),
+    )
+
+    out: list[CrossQuote] = []
+    for p in pairs:
+        cq = CrossQuote(pair=p, at=now)
+        for slug in (p.away_slug, p.home_slug):
+            tk = p.kalshi_tickers.get(slug)
+            kb = books_k.get(tk) if tk else None
+            if kb:
+                cq.kalshi[slug] = kb["ask"]
+                cq.kalshi_size[slug] = kb["ask_size"]
+            tid = p.pm.token_for_slug(slug)
+            pb = books_p.get(tid) if tid else None
+            if pb:
+                cq.poly[slug] = pb["ask"]
+                cq.poly_size[slug] = pb["ask_size"]
+        out.append(cq)
+    return out
+
+
 async def snapshot(
     kalshi_client,
     pm_client: PolymarketClient,
@@ -123,6 +182,91 @@ def format_snapshot(quotes: list[CrossQuote], fee_multiplier: float = 0.07) -> s
         )
 
     return "\n".join(lines)
+
+
+async def monitor_live(
+    kalshi_client,
+    duration_sec: float = 300.0,
+    interval_sec: float = 5.0,
+    fee_multiplier: float = 0.07,
+    only_started: bool = True,
+    min_dollar_profit: float = 0.0,
+) -> dict:
+    """
+    Poll uncached endpoints on both venues and record how long crosses survive.
+
+    Restricted by default to games already underway, because that is where the
+    two venues plausibly diverge — and where the poll monitor's stale-cache
+    artifacts appeared. A cross that survives several consecutive uncached
+    reads is real; one that appears in a single read is not evidence of
+    anything.
+    """
+    stats: dict = {
+        "ticks": 0, "games": 0, "crosses": 0,
+        "streaks": {}, "best": None,
+    }
+
+    async with PolymarketClient() as pm:
+        pairs, rejects, _ = await collect_pairs(kalshi_client, pm)
+        now = datetime.now(timezone.utc)
+        if only_started:
+            pairs = [
+                p for p in pairs
+                if p.start is not None and p.start <= now
+            ]
+        stats["games"] = len(pairs)
+
+        label = "in-progress" if only_started else "all"
+        print(f"\nLIVE monitor (uncached endpoints) — {len(pairs)} {label} games")
+        for p in pairs:
+            age = (now - p.start).total_seconds() / 60 if p.start else 0
+            print(f"   {p.label:<40} started {age:.0f} min ago")
+        if not pairs:
+            print("   (no games in progress right now)")
+            return stats
+
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        streaks: dict[str, int] = {}
+
+        while loop.time() - started < duration_sec:
+            quotes = await live_snapshot(kalshi_client, pm, pairs, fee_multiplier)
+            stats["ticks"] += 1
+            stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+            for cq in quotes:
+                key = cq.pair.pm.condition_id
+                best = cq.best(fee_multiplier)
+                if best and best["profit"] > 0 and best["dollar_profit"] >= min_dollar_profit:
+                    streaks[key] = streaks.get(key, 0) + 1
+                    stats["crosses"] += 1
+                    run = streaks[key]
+                    print(
+                        f"  {stamp} {cq.pair.label[:30]:<32}"
+                        f"+{best['profit'] * 100:5.2f}%  "
+                        f"{best['away_venue'][:1].upper()}/{best['home_venue'][:1].upper()}  "
+                        f"sets={best['sets']:>5}  ${best['dollar_profit']:>7.2f}  "
+                        f"streak={run}",
+                        flush=True,
+                    )
+                    if stats["best"] is None or best["dollar_profit"] > stats["best"]:
+                        stats["best"] = best["dollar_profit"]
+                else:
+                    if streaks.get(key):
+                        print(
+                            f"  {stamp} {cq.pair.label[:30]:<32}"
+                            f"cross ended after {streaks[key]} reads",
+                            flush=True,
+                        )
+                    streaks[key] = 0
+
+            stats["streaks"] = {k: v for k, v in streaks.items() if v}
+            remaining = duration_sec - (loop.time() - started)
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(interval_sec, remaining))
+
+    return stats
 
 
 async def monitor(

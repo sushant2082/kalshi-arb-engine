@@ -25,6 +25,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +80,10 @@ _TICKER = re.compile(
 )
 
 
+# Kalshi game tickers carry the local start time in US Eastern.
+_ET = ZoneInfo("America/New_York")
+
+
 @dataclass
 class KalshiGame:
     """A parsed Kalshi game contract."""
@@ -89,6 +94,8 @@ class KalshiGame:
     away_slug: str
     home_slug: str
     side_slug: str
+    # First pitch in UTC, derived from the ticker's date and HHMM.
+    start_utc: datetime | None = None
 
     @property
     def away_team(self) -> str | None:
@@ -147,6 +154,17 @@ def parse_ticker(ticker: str) -> KalshiGame | None:
     if pair is None:
         return None
 
+    hhmm = m.group("hhmm")
+    start_utc = None
+    try:
+        naive = datetime(
+            game_date.year, game_date.month, game_date.day,
+            int(hhmm[:2]), int(hhmm[2:]),
+        )
+        start_utc = naive.replace(tzinfo=_ET).astimezone(timezone.utc)
+    except ValueError:
+        start_utc = None
+
     game = KalshiGame(
         ticker=ticker,
         series=m.group("series"),
@@ -154,6 +172,7 @@ def parse_ticker(ticker: str) -> KalshiGame | None:
         away_slug=pair[0],
         home_slug=pair[1],
         side_slug=m.group("side"),
+        start_utc=start_utc,
     )
     return game if game.resolvable else None
 
@@ -168,9 +187,19 @@ class GameMatch:
     side_is_home: bool
 
 
-# Kalshi tickers carry the ET date; a late game can therefore sit on the
-# previous UTC day relative to the sportsbook's commence_time.
-_DATE_TOLERANCE = timedelta(days=1)
+# Match on FIRST PITCH, not on date.
+#
+# Baseball teams play the same matchup on consecutive days, so a date-based
+# join maps one sharp line onto every game of the series. Measured live, a
+# single SD @ AZ sharp line matched six Kalshi contracts across three days —
+# including one already effectively decided at 0.97/0.04, which then read as a
+# double-digit "edge" against the next day's pregame line. That is the whole
+# source of the large apparent edges.
+#
+# The ticker's date + HHMM (Eastern) converts to a UTC start that agrees with
+# the sportsbook's commence_time to within a minute, so the window only needs
+# to absorb scheduling slop, not timezone guesswork.
+_START_TOLERANCE = timedelta(minutes=90)
 
 
 def match_games(
@@ -205,16 +234,21 @@ def match_games(
             reject("no sharp line for this matchup")
             continue
 
+        if game.start_utc is None:
+            reject("could not derive a start time from the ticker")
+            continue
+
         chosen = None
+        best = _START_TOLERANCE
         for q in candidates:
             ct = q.get("commence_time")
             if ct is None:
                 continue
-            if abs(ct.date() - game.game_date) <= _DATE_TOLERANCE:
-                chosen = q
-                break
+            gap = abs(ct - game.start_utc)
+            if gap <= best:
+                best, chosen = gap, q
         if chosen is None:
-            reject("matchup found but dates do not line up")
+            reject("matchup found but no game at the same start time")
             continue
 
         if game.side_slug not in (game.away_slug, game.home_slug):

@@ -33,7 +33,7 @@ async def collect_pairs(kalshi_client, pm_client: PolymarketClient):
 
 async def live_snapshot(
     kalshi_client,
-    pm_client: PolymarketClient,
+    pm_source,
     pairs: list,
     fee_multiplier: float = 0.07,
 ) -> list[CrossQuote]:
@@ -67,9 +67,12 @@ async def live_snapshot(
             if tid:
                 tokens.append(tid)
 
+    # pm_source is either PolymarketClient (REST) or PolymarketStream (WS).
+    # Both expose get_books with the same shape, so the transport is invisible
+    # here — which is also what makes the WS path testable against the REST one.
     books_k, books_p = await asyncio.gather(
         kalshi_client.get_books(tickers),
-        pm_client.get_books(tokens),
+        pm_source.get_books(tokens),
     )
 
     out: list[CrossQuote] = []

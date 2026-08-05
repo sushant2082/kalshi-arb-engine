@@ -24,7 +24,8 @@ from pathlib import Path
 import aiosqlite
 
 from arbengine.crossmon import collect_pairs, live_snapshot
-from arbengine.source.polymarket import PolymarketClient
+from arbengine.source.polymarket import PolymarketClient, token_ids
+from arbengine.source.polystream import PolymarketStream
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +114,8 @@ async def record_games(
     interval_sec: float = 5.0,
     fee_multiplier: float = 0.07,
     include_pregame_minutes: float = 30.0,
+    use_stream: bool = True,
+    max_stream_staleness_sec: float = 120.0,
 ) -> dict:
     """
     Record every read for games in progress (and those starting shortly).
@@ -121,8 +124,12 @@ async def record_games(
     up — a three-hour window will usually span several first pitches.
     """
     conn = await init_db(db_path)
-    stats = {"reads": 0, "crosses": 0, "games": set(), "rediscoveries": 0}
+    stats = {
+        "reads": 0, "crosses": 0, "games": set(), "rediscoveries": 0,
+        "stream_reads": 0, "rest_fallback_reads": 0,
+    }
 
+    stream: PolymarketStream | None = None
     try:
         async with PolymarketClient() as pm:
             loop = asyncio.get_event_loop()
@@ -145,6 +152,29 @@ async def record_games(
                     stats["rediscoveries"] += 1
                     log.info("Tracking %d games", len(pairs))
 
+                    # (Re)subscribe the stream to the current slate. Games are
+                    # added as they start, so the token set changes over a
+                    # multi-hour run.
+                    if use_stream and pairs:
+                        wanted = [
+                            tid for p in pairs
+                            for tid in (
+                                p.pm.token_for_slug(p.away_slug),
+                                p.pm.token_for_slug(p.home_slug),
+                            ) if tid
+                        ]
+                        if stream is None or set(wanted) - set(stream.asset_ids):
+                            if stream is not None:
+                                await stream.stop()
+                            stream = PolymarketStream(wanted)
+                            stream.start()
+                            ready = await stream.wait_ready(20)
+                            log.info(
+                                "Polymarket stream %s on %d tokens",
+                                "ready" if ready else "NOT ready (REST fallback)",
+                                len(wanted),
+                            )
+
                 # Rate-limit reality check: each game costs 2 uncached Kalshi
                 # orderbook requests, and the measured basic-tier ceiling is
                 # ~3.6 req/s. A 15-game slate therefore needs >8s per read no
@@ -161,8 +191,30 @@ async def record_games(
                         )
 
                 if pairs:
+                    # Prefer the websocket, fall back to REST when it has
+                    # nothing fresh. An unattended multi-hour run cannot afford
+                    # a silently dead feed: the stream connects cleanly even
+                    # when a subscription is wrong, so "no messages" must never
+                    # be mistaken for "no price movement". Staleness is checked
+                    # against the wall clock rather than trusting `connected`.
+                    source = pm
+                    if stream is not None:
+                        fresh = stream.quotes()
+                        ages = stream.staleness()
+                        newest = min(ages.values()) if ages else 1e9
+                        if fresh and newest <= max_stream_staleness_sec:
+                            source = stream
+                            stats["stream_reads"] += 1
+                        else:
+                            stats["rest_fallback_reads"] += 1
+                            if stats["rest_fallback_reads"] % 20 == 1:
+                                log.warning(
+                                    "Polymarket stream stale (%.0fs) — using REST",
+                                    newest,
+                                )
+
                     quotes = await live_snapshot(
-                        kalshi_client, pm, pairs, fee_multiplier
+                        kalshi_client, source, pairs, fee_multiplier
                     )
                     crossed = 0
                     for cq in quotes:
@@ -182,6 +234,8 @@ async def record_games(
                     break
                 await asyncio.sleep(min(interval_sec, remaining))
     finally:
+        if stream is not None:
+            await stream.stop()
         await conn.close()
 
     stats["games"] = sorted(stats["games"])

@@ -489,70 +489,6 @@ async def _run_demo(settings: Settings, duration_sec: float = 60.0) -> None:
     await conn.close()
 
 
-async def _run_sxbet(settings: Settings, duration_sec: float | None) -> None:
-    """
-    Sustained SX Bet within-market scan.
-
-    Reported separately from the Kalshi surfaces because the risk profile is
-    different in both directions: no fee to clear and no cross-venue resolution
-    risk, but the profit is conditional on the market not voiding.
-    """
-    from arbengine.source.sxbet import SxBetClient
-    from arbengine.sxscan import scan_loop
-
-    seen: dict[str, float] = {}
-
-    async def on_opportunity(opp) -> None:
-        first = opp.key not in seen
-        seen[opp.key] = opp.profit_per_set
-        marker = "NEW " if first else "still"
-        push = "  PUSH-POSSIBLE" if opp.push_possible else ""
-        print(
-            f"  {marker} {opp.league:<8} {opp.outcome_one[:26]:<28} "
-            f"cost=${opp.total_cost:.4f}  profit={opp.profit_per_set * 100:+.2f}%  "
-            f"fillable=${opp.fillable:,.0f}  alive={opp.persistence_sec:.0f}s{push}",
-            flush=True,
-        )
-
-    async def on_pass(total, stats) -> None:
-        best = stats.best_overround
-        med = stats.median_overround
-        log.info(
-            "pass %d: %d markets, %d two-sided books, %d locks | "
-            "best overround %.4f, median %.4f",
-            total.passes, stats.markets_seen, stats.books_two_sided,
-            stats.opportunities, best or 0, med or 0,
-        )
-        if not stats.opportunities and stats.tightest:
-            for ov, league, name in stats.tightest[:3]:
-                log.info(
-                    "    closest: %-8s %-28s %.4f (%+.2f%% from locking)",
-                    league, name[:28], ov, (ov - 1) * 100,
-                )
-
-    print(
-        "\nSX Bet within-market scan — 0% taker fee on straight bets, so the "
-        "gross gap is the net gap.\nDownside is zero rather than negative: a "
-        "voided market returns both stakes.\n"
-    )
-    async with SxBetClient() as client:
-        total = await scan_loop(
-            client, on_opportunity, on_pass,
-            min_profit=0.0, duration_sec=duration_sec,
-            interval_sec=settings.kalshi_poll_sec,
-        )
-
-    print(
-        f"\n{total.passes} passes, {total.opportunities} lock-sightings across "
-        f"{total.books_two_sided} two-sided books."
-    )
-    if total.best_overround:
-        print(
-            f"best overround seen: {total.best_overround:.4f} "
-            f"({(total.best_overround - 1) * 100:+.2f}% from locking)\n"
-        )
-
-
 async def _run_crossmlb(
     settings: Settings, duration_sec: float | None, interval_sec: float
 ) -> None:
@@ -775,15 +711,15 @@ def run() -> None:
     )
     parser.add_argument(
         "command", nargs="?", default="scan",
-        choices=["scan", "stream", "discover", "backtest", "demo", "sxbet",
+        choices=["scan", "stream", "discover", "backtest", "demo",
                  "crossmlb", "crosslive", "crossrec"],
         help=(
             "scan: REST polling loop. stream: event-driven WebSocket scan. "
             "discover: list candidate series. backtest: verify locks end to "
             "end on live geometry. demo: watch paper trading run against "
-            "synthetic dislocations. sxbet: scan SX Bet for zero-fee "
-            "within-market locks. crossmlb: live Kalshi vs Polymarket MLB "
-            "price monitor."
+            "synthetic dislocations. crossmlb: Kalshi vs Polymarket MLB "
+            "price monitor. crosslive: same on uncached/live feeds. "
+            "crossrec: record a full game to SQLite."
         ),
     )
     parser.add_argument(
@@ -806,7 +742,7 @@ def run() -> None:
     _setup_logging(args.verbose)
     settings = Settings()
 
-    if args.command != "sxbet" and not settings.kalshi_api_key_id:
+    if not settings.kalshi_api_key_id:
         log.error("KALSHI_API_KEY_ID is not set. Copy .env.example to .env and fill it in.")
         sys.exit(1)
 
@@ -819,8 +755,6 @@ def run() -> None:
             asyncio.run(_run_backtest(settings))
         elif args.command == "demo":
             asyncio.run(_run_demo(settings, args.duration or 60.0))
-        elif args.command == "sxbet":
-            asyncio.run(_run_sxbet(settings, args.duration))
         elif args.command == "crossmlb":
             asyncio.run(_run_crossmlb(settings, args.duration, args.interval))
         elif args.command == "crosslive":

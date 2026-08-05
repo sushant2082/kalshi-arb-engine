@@ -239,6 +239,23 @@ class PolymarketStream:
 
     # ── Reading ───────────────────────────────────────────────────────────────
 
+    async def get_books(
+        self, token_ids: list[str], concurrency: int = 0
+    ) -> dict[str, dict]:
+        """
+        Drop-in replacement for PolymarketClient.get_books.
+
+        Same signature and same return shape, so the monitors can take either
+        transport without branching. Reads maintained state rather than making
+        requests, so `concurrency` is accepted and ignored.
+
+        Tokens that have not yet received a book are omitted rather than
+        returned empty — an absent quote is skipped downstream, whereas a
+        None-priced one would be treated as a real missing side.
+        """
+        live = self.quotes()
+        return {t: live[t] for t in token_ids if t in live}
+
     def quotes(self) -> dict[str, dict]:
         """Current top-of-book per token, in the REST path's shape."""
         return {

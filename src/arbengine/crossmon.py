@@ -81,8 +81,8 @@ def format_snapshot(quotes: list[CrossQuote], fee_multiplier: float = 0.07) -> s
         return "\n".join(lines)
 
     header = (
-        f"  {'game':<34}{'K away':>8}{'K home':>8}"
-        f"{'P away':>8}{'P home':>8}{'best':>8}  verdict"
+        f"  {'game':<30}{'K away':>7}{'K home':>7}"
+        f"{'P away':>7}{'P home':>7}{'total':>8}{'sets':>7}{'$':>8}  verdict"
     )
     lines.append(header)
 
@@ -107,15 +107,19 @@ def format_snapshot(quotes: list[CrossQuote], fee_multiplier: float = 0.07) -> s
                     f"{best['away_venue'][:1].upper()}/{best['home_venue'][:1].upper()}"
                 )
                 verdict = (
-                    f"*** ARB +{best['profit'] * 100:.2f}%  buy away on "
-                    f"{best['away_venue']}, home on {best['home_venue']} [{venues}]"
+                    f"ARB +{best['profit'] * 100:.2f}% [{venues}] "
+                    f"= ${best['dollar_profit']:.2f} max"
                 )
+                if best["dollar_profit"] < 1.0:
+                    verdict += "  (too thin to matter)"
             else:
                 verdict = f"no arb ({best['profit'] * 100:+.2f}%)"
 
+        sets = f"{best['sets']:,}" if best else "  --  "
+        dollars = f"${best['dollar_profit']:.2f}" if best else "  --  "
         lines.append(
-            f"  {p.label[:33]:<34}{f(ka):>8}{f(kh):>8}{f(pa):>8}{f(ph):>8}"
-            f"{total:>8}  {verdict}"
+            f"  {p.label[:29]:<30}{f(ka):>7}{f(kh):>7}{f(pa):>7}{f(ph):>7}"
+            f"{total:>8}{sets:>7}{dollars:>8}  {verdict}"
         )
 
     return "\n".join(lines)

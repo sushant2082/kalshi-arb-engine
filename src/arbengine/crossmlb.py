@@ -261,6 +261,24 @@ class CrossQuote:
             if home_venue == "kalshi":
                 fee += order_fee(h_price, 100, fee_multiplier) / 100.0
             total = a_price + h_price + fee
+
+            # Fillable size is the thinner leg, and it is the number that
+            # decides whether an edge is worth anything. Polymarket advertises
+            # a `liquidity` figure in the thousands that is NOT top-of-book
+            # depth: measured live, a +0.36% cross had $5,543 of advertised
+            # liquidity and 50 shares at the best ask, capping the whole trade
+            # at 18 cents of profit. Reporting a percentage without the size
+            # makes a rounding error look like an opportunity.
+            a_size = (
+                self.kalshi_size.get(away, 0) if away_venue == "kalshi"
+                else self.poly_size.get(away, 0)
+            )
+            h_size = (
+                self.kalshi_size.get(home, 0) if home_venue == "kalshi"
+                else self.poly_size.get(home, 0)
+            )
+            sets = int(min(a_size or 0, h_size or 0))
+
             out.append({
                 "away_venue": away_venue,
                 "home_venue": home_venue,
@@ -269,6 +287,8 @@ class CrossQuote:
                 "fee": fee,
                 "total": total,
                 "profit": 1.0 - total,
+                "sets": sets,
+                "dollar_profit": (1.0 - total) * sets,
                 "cross_venue": away_venue != home_venue,
             })
         return sorted(out, key=lambda c: c["total"])

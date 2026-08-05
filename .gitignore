@@ -229,3 +229,6 @@ kalshi_key*
 *.db
 *.db-journal
 *.csv
+
+# Scheduled-run logs
+logs/

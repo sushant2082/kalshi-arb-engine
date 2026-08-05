@@ -596,6 +596,46 @@ async def _run_crosslive(
     print()
 
 
+async def _run_crossrec(
+    settings: Settings, duration_sec: float | None, interval_sec: float
+) -> None:
+    """Record a full game's worth of cross-venue reads to SQLite."""
+    from arbengine.crossrec import record_games, summarize
+
+    db = settings.db_path.with_name("crossreads.db")
+    key = load_private_key(settings.kalshi_private_key_path)
+    hours = (duration_sec or 10800.0) / 3600.0
+    print(f"\nRecording cross-venue reads for {hours:.1f}h -> {db.name}")
+    print("Logging every read, including non-crossing ones — otherwise a rare")
+    print("event and a broken scanner look identical afterwards.\n")
+
+    async with _client(settings, key) as client:
+        stats = await record_games(
+            client, db,
+            duration_sec=duration_sec or 10800.0,
+            interval_sec=interval_sec if interval_sec != 30.0 else 5.0,
+            fee_multiplier=settings.fee_multiplier,
+        )
+
+    print(f"\n{stats['reads']:,} reads across {len(stats['games'])} games; "
+          f"{stats['crosses']:,} crossed.")
+    s = await summarize(db)
+    if s["per_game"]:
+        print(f"\n{'game':<38}{'reads':>7}{'cross':>7}{'max%':>8}{'max$':>9}")
+        for g in s["per_game"][:12]:
+            mp = (g["max_profit"] or 0) * 100
+            md = g["max_dollars"] or 0
+            print(f"  {str(g['game'])[:35]:<36}{g['reads']:>7}"
+                  f"{g['crosses'] or 0:>7}{mp:>8.2f}{md:>9.2f}")
+    if s["by_phase"]:
+        print(f"\nby game phase (minutes since first pitch):")
+        print(f"  {'phase':>8}{'reads':>8}{'crosses':>9}{'max%':>8}")
+        for b in s["by_phase"]:
+            print(f"  {b['bucket']:>6}m{b['reads']:>8}{b['crosses'] or 0:>9}"
+                  f"{(b['max_profit'] or 0) * 100:>8.2f}")
+    print()
+
+
 def _make_broker(settings: Settings) -> PaperBroker | None:
     if not settings.paper_enabled:
         return None
@@ -736,7 +776,7 @@ def run() -> None:
     parser.add_argument(
         "command", nargs="?", default="scan",
         choices=["scan", "stream", "discover", "backtest", "demo", "sxbet",
-                 "crossmlb", "crosslive"],
+                 "crossmlb", "crosslive", "crossrec"],
         help=(
             "scan: REST polling loop. stream: event-driven WebSocket scan. "
             "discover: list candidate series. backtest: verify locks end to "
@@ -785,6 +825,8 @@ def run() -> None:
             asyncio.run(_run_crossmlb(settings, args.duration, args.interval))
         elif args.command == "crosslive":
             asyncio.run(_run_crosslive(settings, args.duration, args.interval))
+        elif args.command == "crossrec":
+            asyncio.run(_run_crossrec(settings, args.duration, args.interval))
         else:
             asyncio.run(_run_scan(settings, args.once, args.iterations))
     except KeyboardInterrupt:

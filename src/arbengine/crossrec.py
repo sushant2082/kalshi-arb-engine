@@ -18,7 +18,7 @@ genuinely rare event from a scanner that stopped working.
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -134,10 +134,19 @@ async def record_games(
         async with PolymarketClient() as pm:
             loop = asyncio.get_event_loop()
             started = loop.time()
+            # Wall clock, not the monotonic loop clock. On macOS the monotonic
+            # clock does not advance while the system sleeps, so a "run for 11
+            # hours" budget measured that way only consumes waking time — an
+            # overnight sleep stretched one run to 23h41m of wall time. For a
+            # window meant to cover a day's game slate, wall clock is the
+            # intent.
+            wall_deadline = datetime.now(timezone.utc) + timedelta(
+                seconds=duration_sec
+            )
             pairs: list = []
             last_discovery = -1e9
 
-            while loop.time() - started < duration_sec:
+            while datetime.now(timezone.utc) < wall_deadline:
                 # Refresh the slate every 10 minutes.
                 if loop.time() - last_discovery > 600:
                     all_pairs, _, _ = await collect_pairs(kalshi_client, pm)
@@ -229,7 +238,9 @@ async def record_games(
                         stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
                         log.info("%s  %d/%d games crossing", stamp, crossed, len(quotes))
 
-                remaining = duration_sec - (loop.time() - started)
+                remaining = (
+                    wall_deadline - datetime.now(timezone.utc)
+                ).total_seconds()
                 if remaining <= 0:
                     break
                 await asyncio.sleep(min(interval_sec, remaining))

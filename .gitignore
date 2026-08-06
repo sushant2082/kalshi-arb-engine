@@ -227,8 +227,13 @@ kalshi_key*
 
 # SQLite databases and CSV output produced by the scan loop
 *.db
+# Published research datasets are the exception — see data/README.md
+!data/*.db
 *.db-journal
 *.csv
 
 # Scheduled-run logs
 logs/
+
+# macOS
+.DS_Store

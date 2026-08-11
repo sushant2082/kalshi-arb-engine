@@ -572,6 +572,39 @@ async def _run_crossrec(
     print()
 
 
+async def _run_crossevent(
+    settings: Settings, duration_sec: float | None
+) -> None:
+    """Event-driven cross-lifetime recorder over both websockets."""
+    from arbengine.crossevent import record_events, summarize
+
+    db = settings.db_path.with_name("crossevents.db")
+    key = load_private_key(settings.kalshi_private_key_path)
+    dur = duration_sec or 10800.0
+
+    print(f"\nEvent-driven cross recorder -> {db.name}")
+    print("Reacting to both venues' websocket pushes at 50ms, recording each")
+    print("cross OPEN and CLOSE. Polling could only establish 'shorter than 18s'.\n")
+
+    async with _client(settings, key) as client:
+        stats = await record_events(
+            client, db, duration_sec=dur, fee_multiplier=settings.fee_multiplier
+        )
+
+    print(f"\n{stats['ticks']:,} ticks | {stats['kalshi_updates']:,} kalshi + "
+          f"{stats['poly_updates']:,} polymarket updates")
+    print(f"{stats['evaluations']:,} evaluations over {stats['games']} games")
+    print(f"{stats['events']} complete cross events recorded")
+
+    s = await summarize(db)
+    if s["events"]:
+        print(f"\nCROSS LIFETIME: mean {s['avg_sec']}s, max {s['max_sec']}s")
+        print(f"  {'duration':<14}{'count':>7}{'largest $':>12}")
+        for b, n, d in s["buckets"]:
+            print(f"  {b:<14}{n:>7}{d or 0:>12.2f}")
+    print()
+
+
 def _make_broker(settings: Settings) -> PaperBroker | None:
     if not settings.paper_enabled:
         return None
@@ -712,14 +745,15 @@ def run() -> None:
     parser.add_argument(
         "command", nargs="?", default="scan",
         choices=["scan", "stream", "discover", "backtest", "demo",
-                 "crossmlb", "crosslive", "crossrec"],
+                 "crossmlb", "crosslive", "crossrec", "crossevent"],
         help=(
             "scan: REST polling loop. stream: event-driven WebSocket scan. "
             "discover: list candidate series. backtest: verify locks end to "
             "end on live geometry. demo: watch paper trading run against "
             "synthetic dislocations. crossmlb: Kalshi vs Polymarket MLB "
             "price monitor. crosslive: same on uncached/live feeds. "
-            "crossrec: record a full game to SQLite."
+            "crossrec: record a full game to SQLite. crossevent: measure "
+            "true cross lifetime from both websockets."
         ),
     )
     parser.add_argument(
@@ -761,6 +795,8 @@ def run() -> None:
             asyncio.run(_run_crosslive(settings, args.duration, args.interval))
         elif args.command == "crossrec":
             asyncio.run(_run_crossrec(settings, args.duration, args.interval))
+        elif args.command == "crossevent":
+            asyncio.run(_run_crossevent(settings, args.duration))
         else:
             asyncio.run(_run_scan(settings, args.once, args.iterations))
     except KeyboardInterrupt:

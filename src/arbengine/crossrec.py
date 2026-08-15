@@ -23,6 +23,10 @@ from pathlib import Path
 
 import aiosqlite
 
+from arbengine.crosspaper import (
+    CrossPaperTrader, init_db as paper_db, report, save_position,
+    settle_open_positions,
+)
 from arbengine.crossmon import collect_pairs, live_snapshot
 from arbengine.source.polymarket import PolymarketClient, token_ids
 from arbengine.source.polystream import PolymarketStream
@@ -116,6 +120,8 @@ async def record_games(
     include_pregame_minutes: float = 30.0,
     use_stream: bool = True,
     max_stream_staleness_sec: float = 120.0,
+    trader: "CrossPaperTrader | None" = None,
+    paper_db_path: Path | None = None,
 ) -> dict:
     """
     Record every read for games in progress (and those starting shortly).
@@ -127,7 +133,12 @@ async def record_games(
     stats = {
         "reads": 0, "crosses": 0, "games": set(), "rediscoveries": 0,
         "stream_reads": 0, "rest_fallback_reads": 0,
+        "positions": 0, "settled": 0,
     }
+    pconn = await paper_db(paper_db_path) if (trader and paper_db_path) else None
+    # One position per game at a time: re-entering the same cross on every
+    # read would book the same opportunity dozens of times over.
+    open_games: set[str] = set()
 
     stream: PolymarketStream | None = None
     try:
@@ -159,6 +170,11 @@ async def record_games(
                     ]
                     last_discovery = loop.time()
                     stats["rediscoveries"] += 1
+                    if trader and pconn:
+                        n = await settle_open_positions(
+                            pconn, kalshi_client, trader
+                        )
+                        stats["settled"] += n
                     log.info("Tracking %d games", len(pairs))
 
                     # (Re)subscribe the stream to the current slate. Games are
@@ -227,9 +243,29 @@ async def record_games(
                     )
                     crossed = 0
                     for cq in quotes:
-                        if await record_read(conn, cq, fee_multiplier):
+                        is_cross = await record_read(conn, cq, fee_multiplier)
+                        if is_cross:
                             crossed += 1
                         stats["games"].add(cq.pair.label)
+
+                        if trader and pconn and is_cross:
+                            key = cq.pair.pm.condition_id
+                            if key not in open_games:
+                                best = cq.best(fee_multiplier)
+                                pos = trader.open_position(
+                                    cq.pair, best, datetime.now(timezone.utc)
+                                )
+                                if pos:
+                                    await save_position(pconn, pos)
+                                    open_games.add(key)
+                                    stats["positions"] += 1
+                                    log.info(
+                                        "PAPER %s %s: %d sets @ %.4f, "
+                                        "expect $%.2f",
+                                        pos.fill_status.upper(),
+                                        pos.game[:26], pos.sets_wanted,
+                                        best["total"], pos.expected_profit,
+                                    )
                     await conn.commit()
                     stats["reads"] += len(quotes)
                     stats["crosses"] += crossed
@@ -245,6 +281,15 @@ async def record_games(
                     break
                 await asyncio.sleep(min(interval_sec, remaining))
     finally:
+        if trader and pconn:
+            # Final settlement sweep: games that finished during the run.
+            try:
+                stats["settled"] += await settle_open_positions(
+                    pconn, kalshi_client, trader
+                )
+            except Exception as exc:
+                log.warning("Final settlement sweep failed: %s", exc)
+            await pconn.close()
         if stream is not None:
             await stream.stop()
         await conn.close()

@@ -538,9 +538,18 @@ async def _run_crossrec(
     """Record a full game's worth of cross-venue reads to SQLite."""
     from arbengine.crossrec import record_games, summarize
 
+    from arbengine.crosspaper import CrossPaperTrader, report
+
     db = settings.db_path.with_name("crossreads.db")
+    paper = settings.db_path.with_name("crosspaper.db")
     key = load_private_key(settings.kalshi_private_key_path)
     hours = (duration_sec or 10800.0) / 3600.0
+    trader = CrossPaperTrader(
+        bankroll=settings.paper_bankroll,
+        max_sets=settings.paper_max_sets_per_opp,
+        leg_fill_prob=settings.paper_leg_fill_prob,
+        fee_multiplier=settings.fee_multiplier,
+    ) if settings.paper_enabled else None
     print(f"\nRecording cross-venue reads for {hours:.1f}h -> {db.name}")
     print("Logging every read, including non-crossing ones — otherwise a rare")
     print("event and a broken scanner look identical afterwards.\n")
@@ -551,10 +560,29 @@ async def _run_crossrec(
             duration_sec=duration_sec or 10800.0,
             interval_sec=interval_sec if interval_sec != 30.0 else 5.0,
             fee_multiplier=settings.fee_multiplier,
+            trader=trader,
+            paper_db_path=paper if trader else None,
         )
 
     print(f"\n{stats['reads']:,} reads across {len(stats['games'])} games; "
           f"{stats['crosses']:,} crossed.")
+    if trader:
+        print(f"paper: {stats['positions']} positions opened, "
+              f"{stats['settled']} settled")
+        r = await report(paper, trader.starting_bankroll)
+        print()
+        print("── PAPER P&L " + "─" * 52)
+        print(f"  bankroll     ${r['starting_bankroll']:,.2f} -> "
+              f"${r['ending_bankroll']:,.2f}   "
+              f"(realized ${r['realized_pnl']:+,.2f})")
+        print(f"  from hedged  ${r['hedged_pnl']:+,.2f}   "
+              f"(the cross implied ${r['expected_on_hedged']:+,.2f})")
+        print(f"  from broken  ${r['broken_pnl']:+,.2f}   "
+              f"<- one leg only; variance, not edge")
+        print(f"  settled      {r['settled']} positions, {r['winners']} profitable")
+        print("  Positions still open settle once their Kalshi market resolves;")
+        print("  re-run to sweep them, or query crosspaper.db directly.")
+        print("─" * 64)
     s = await summarize(db)
     if s["per_game"]:
         print(f"\n{'game':<38}{'reads':>7}{'cross':>7}{'max%':>8}{'max$':>9}")

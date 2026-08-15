@@ -24,7 +24,7 @@ git checkout nikhil-testing
 
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest -q          # 279 tests, all should pass
+.venv/bin/python -m pytest -q          # 294 tests, all should pass
 ```
 
 Get Kalshi credentials: **kalshi.com → Account → API Keys → Create**. You get a
@@ -180,20 +180,34 @@ that is the point.
 
 ## What we already know
 
-From an 11,614-read study (see `data/ANALYSIS.md`):
+**Frequency** — from an 11,614-read polling study (`data/ANALYSIS.md`):
+crosses are **~40× more common in live play than pregame** (0.07% → 4.83%),
+rising steadily as a game progresses.
 
-- Crosses are **~40× more frequent in live play than pregame** (0.07% → 4.83%)
-- The typical cross is **0.32% and worth $0.07** once capped by the thinner leg
-- **78% exist for a single 18-second read**
-- Six of 165 crosses exceeded $100; four of those six were genuine venue
-  disagreements with both books internally coherent
+**Lifetime** — from a 30-minute event-driven run over 5 live games, the first
+measurement at 50ms resolution:
+
+| | |
+|---|---|
+| crosses detected | 37 |
+| **actually tradeable** | **19** (18 had no depth behind the quote) |
+| median lifetime | **1.9s** |
+| longest | 262s |
+| over 30s | 3 of 19 |
+
+Largest tradeable ones ranged $290–$1,539. The single biggest lasted **1.9
+seconds**.
+
+This sample is small — five games, half an hour. Confirming or overturning it
+is exactly what a full-day run is for.
 
 ## What we don't know
 
-- **How long a cross actually lasts.** 18-second polling only proves "shorter
-  than 18 seconds". `crossevent` measures this at 50ms — that data does not
-  exist yet, and it decides whether any of this is actionable.
 - **Whether the quoted depth would actually fill.** No orders have been placed.
+  Displayed size is not executed size.
+- **Whether a two-leg order can land inside the window.** Median tradeable
+  lifetime is under two seconds; placing sequential orders on two venues is
+  unlikely to fit inside that, and nothing here has tested it.
 - **Whether a hedge holds through settlement.** See below.
 
 ## These are not risk-free positions

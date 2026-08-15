@@ -294,13 +294,18 @@ async def record_events(
             # the measured lifetime downward by discarding the longest events.
             now = datetime.now(timezone.utc)
             for key, live in open_crosses.items():
+                # opened_at carries a value; closed_at is NULL because the
+                # cross had not ended when the run did. Getting these the wrong
+                # way round is what broke this insert: 16 columns against 15
+                # placeholders, so the whole censored batch was lost — exactly
+                # the events this branch exists to preserve.
                 await conn.execute(
                     """INSERT INTO cross_events (
                         game,condition_id,opened_at,closed_at,duration_sec,
                         peak_profit,peak_total,peak_sets,peak_dollars,
                         open_kalshi_away,open_kalshi_home,open_poly_away,
                         open_poly_home,minutes_in,ticks_open,trigger
-                       ) VALUES (?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       ) VALUES (?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (live.game, key, live.opened_at.isoformat(),
                      (now - live.opened_at).total_seconds(), live.peak_profit,
                      live.peak_total, live.peak_sets, live.peak_dollars,

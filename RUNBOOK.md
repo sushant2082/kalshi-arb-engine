@@ -3,55 +3,113 @@
 Everything here is **read-only and simulated**. No order is placed on any
 venue, no funds move. The engine has no write path to either exchange.
 
-## What you need
+## Start here — the whole thing in six steps
 
-| | |
-|---|---|
-| A Kalshi account | free; **US-only** — the API geo-blocks elsewhere |
-| Kalshi API key + RSA private key | from Kalshi's API settings |
-| Python 3.11+ | |
-| Polymarket | nothing — its read APIs need no auth |
+### 1. Get Kalshi API credentials
 
-Both venues' market data is public. You need Kalshi credentials only because
-Kalshi requires a signed key for *any* request, including reads.
+Go to **kalshi.com → Account → Profile → API Keys → Create New Key**.
 
-## Setup
+You get two things:
+- a **Key ID** (a UUID, shown on screen — copy it)
+- an **RSA private key file** (downloads once, cannot be re-downloaded)
+
+You need a Kalshi account for this, but **no money in it**. Nothing here places
+an order. Kalshi just requires a signed key for every request, including
+read-only ones.
+
+Polymarket needs nothing at all — its market data is fully public.
+
+> **This must run from inside the US.** Kalshi's API is unreliable or blocked
+> elsewhere. Testing from India, only about 1 request in 3 completed.
+
+### 2. Clone and install
 
 ```bash
 git clone git@github.com:sushant2082/kalshi-arb-engine.git
 cd kalshi-arb-engine
-git checkout nikhil-testing
+git checkout testing
 
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest -q          # 294 tests, all should pass
 ```
 
-Get Kalshi credentials: **kalshi.com → Account → API Keys → Create**. You get a
-key ID and download an RSA private key once. Save the key file into the repo
-directory (it is gitignored).
+### 3. Check it built correctly
 
 ```bash
+.venv/bin/python -m pytest -q
+```
+
+Expect **294 passed**. If anything fails, stop — do not run against live data
+with a broken build.
+
+### 4. Add your credentials
+
+Put the downloaded key file in the repo directory (it is gitignored, so it
+will not be committed):
+
+```bash
+mv ~/Downloads/kalshi-key.pem ./kalshi_key.pem
 cp .env.example .env
 ```
 
-Edit `.env`:
+Then edit `.env` and set exactly two lines:
 
 ```
-KALSHI_API_KEY_ID=your-key-id-here
+KALSHI_API_KEY_ID=paste-your-key-id-here
 KALSHI_PRIVATE_KEY_PATH=kalshi_key.pem
 ```
 
-Verify it works:
+### 5. Confirm you are connected
 
 ```bash
 .venv/bin/arbengine discover
 ```
 
-Series and market counts means you are connected. A 401 means the key ID or key
-file path is wrong.
+A table of series and market counts means it works.
+
+- **401 Unauthorized** → the Key ID or the key file path is wrong
+- **connection errors** → network or region problem, see the note in step 1
+
+### 6. Run the test
+
+```bash
+./scripts/fullday.sh
+```
+
+Start it before the games — early afternoon ET is fine. It waits quietly until
+games begin, picks them up as they start, and runs for 10 hours by default.
+
+Leave it alone. `Ctrl-C` stops it cleanly and still prints the report.
+
+```bash
+./scripts/fullday.sh 6                 # 6 hours instead of 10
+.venv/bin/python scripts/report.py     # re-read results any time
+```
+
+**Re-run `report.py` the next day.** Positions settle only after their Kalshi
+market resolves, so P&L is incomplete until the games have finished.
+
+### What to send back
+
+Either the printed report, or the three database files:
+
+```
+crossevents.db   how long each cross lasted
+crossreads.db    every price observation
+crosspaper.db    simulated positions and P&L
+```
 
 ---
+
+## What you need
+
+| | |
+|---|---|
+| A Kalshi account | free; **US-only** — the API is unreliable elsewhere |
+| Kalshi API key + RSA private key | from Kalshi's API settings |
+| Python 3.11+ | |
+| Money in the account | **no** — nothing places an order |
+| Polymarket account | **no** — its read APIs need no auth |
 
 ## The main thing to run
 

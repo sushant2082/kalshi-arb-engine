@@ -19,8 +19,34 @@ from arbengine.value.games import KALSHI_SLUG_TO_TEAM
 log = logging.getLogger(__name__)
 
 
-async def collect_pairs(kalshi_client, pm_client: PolymarketClient):
-    """Discover MLB games carried by both venues."""
+async def collect_pairs(
+    kalshi_client, pm_client: PolymarketClient, attempts: int = 5
+):
+    """
+    Discover MLB games carried by both venues.
+
+    Retried as a unit. Discovery is the one call every long-running job makes
+    before it can do anything, so a transient failure here ends the whole run
+    rather than costing one read — which is exactly what happened to a
+    multi-hour measurement when a TLS handshake failed at startup.
+    """
+    delay = 3.0
+    for attempt in range(attempts):
+        try:
+            return await _collect_pairs_once(kalshi_client, pm_client)
+        except Exception as exc:
+            if attempt >= attempts - 1:
+                raise
+            log.warning(
+                "Discovery failed (%s: %s); retrying in %.0fs (attempt %d/%d)",
+                type(exc).__name__, str(exc)[:80], delay, attempt + 1, attempts,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60.0)
+    raise RuntimeError("unreachable")
+
+
+async def _collect_pairs_once(kalshi_client, pm_client: PolymarketClient):
     kalshi_markets = await kalshi_client.list_markets(
         series_ticker="KXMLBGAME", max_pages=2
     )

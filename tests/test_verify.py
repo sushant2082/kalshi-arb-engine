@@ -163,3 +163,63 @@ def test_there_is_no_needs_review_verdict() -> None:
         ({}, _pm(), None, None, ("A", "B"), ("C", "D")),
     ]:
         assert verify_pair(*args).verdict in ("confirmed", "rejected")
+
+
+# ── Resilience: transient network failures must not end a long run ────────────
+
+def test_discovery_retries_transient_failures() -> None:
+    """
+    A TLS handshake failure at startup once killed a multi-hour unattended
+    measurement. Discovery is the one call every long job makes before it can
+    do anything, so it is retried as a unit rather than costing the whole run.
+    """
+    import asyncio
+
+    from arbengine.crossmon import collect_pairs
+
+    class FlakyKalshi:
+        def __init__(self):
+            self.calls = 0
+
+        async def list_markets(self, **kwargs):
+            self.calls += 1
+            if self.calls < 3:
+                raise ConnectionError("simulated transport failure")
+            return []
+
+    class StubPolymarket:
+        async def markets_by_tag(self, tag):
+            return []
+
+    async def run():
+        k = FlakyKalshi()
+        pairs, rejects, by_ticker = await collect_pairs(k, StubPolymarket())
+        return k.calls, pairs
+
+    calls, pairs = asyncio.run(run())
+    assert calls == 3, "should have retried until it succeeded"
+    assert pairs == []
+
+
+def test_discovery_gives_up_eventually() -> None:
+    """Retrying forever would hide a genuine outage behind a silent hang."""
+    import asyncio
+
+    from arbengine.crossmon import collect_pairs
+
+    class AlwaysDown:
+        async def list_markets(self, **kwargs):
+            raise ConnectionError("down")
+
+    class StubPolymarket:
+        async def markets_by_tag(self, tag):
+            return []
+
+    async def run():
+        await collect_pairs(AlwaysDown(), StubPolymarket(), attempts=2)
+
+    try:
+        asyncio.run(run())
+        raise AssertionError("should have raised")
+    except ConnectionError:
+        pass

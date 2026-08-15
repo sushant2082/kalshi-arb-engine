@@ -126,11 +126,36 @@ class PolymarketClient:
                 await asyncio.sleep(self._interval - elapsed)
             self._last = _t.monotonic()
 
-    async def _get(self, url: str, params: dict[str, Any] | None = None) -> Any:
-        await self._throttle()
-        resp = await self._http.get(url, params=params)
-        resp.raise_for_status()
-        return resp.json()
+    async def _get(
+        self, url: str, params: dict[str, Any] | None = None, retries: int = 4
+    ) -> Any:
+        """
+        GET with retry on transport failures.
+
+        Previously had none, so a single dropped connection propagated straight
+        out and ended whatever long-running job was calling it. HTTP status
+        errors still raise immediately — a 404 or 422 will not fix itself, and
+        retrying them just delays the real error.
+        """
+        delay = 2.0
+        for attempt in range(retries + 1):
+            await self._throttle()
+            try:
+                resp = await self._http.get(url, params=params)
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError:
+                raise
+            except httpx.RequestError as exc:
+                if attempt >= retries:
+                    log.warning("Polymarket request failed for %s: %s", url, exc)
+                    raise
+                log.warning(
+                    "Polymarket connection error: %s; retrying in %.0fs "
+                    "(attempt %d/%d)", exc, delay, attempt + 1, retries,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
 
     # Gamma silently caps `limit` at 100 regardless of what is requested, so
     # paginating on offset is the only way to see past the first page. Sending

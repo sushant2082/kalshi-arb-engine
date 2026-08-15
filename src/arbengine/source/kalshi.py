@@ -260,6 +260,11 @@ class KalshiClient:
         read_budget: float = 200.0,
         bucket_capacity: float | None = None,
         request_cost: float = 10.0,
+        # Connection failures need far more patience than rate limits: a
+        # dropped TLS handshake is usually a network interruption lasting tens
+        # of seconds, where a 429 clears in milliseconds.
+        connect_retry_delay: float = 2.0,
+        connect_retry_max: float = 60.0,
         # Stay just under the budget so a shared key or clock skew does not
         # push us over the server's balance.
         safety_factor: float = 0.9,
@@ -273,6 +278,8 @@ class KalshiClient:
         self._retry_base_delay = retry_base_delay
         self._retry_max_delay = retry_max_delay
         self._request_cost = request_cost
+        self._connect_retry_delay = connect_retry_delay
+        self._connect_retry_max = connect_retry_max
         self._bucket = TokenBucket(
             refill_rate=read_budget * safety_factor,
             capacity=(
@@ -387,13 +394,24 @@ class KalshiClient:
                 log.warning("Kalshi HTTP %s on %s", exc.response.status_code, path)
                 raise
             except httpx.RequestError as exc:
+                # A transport failure is a different animal from a 429. Rate
+                # limiting clears in milliseconds because Kalshi applies no
+                # cooldown, so the aggressive base delay above is right for it.
+                # A dropped connection or TLS failure is usually a network
+                # interruption lasting tens of seconds, and the same fast
+                # backoff exhausts every retry in about three seconds — which
+                # is how a transient blip killed a multi-hour unattended run.
                 if attempt >= self._max_retries:
                     log.warning("Kalshi request error on %s: %s", path, exc)
                     raise
+                wait = max(delay, self._connect_retry_delay * (2 ** attempt))
+                wait = min(wait, self._connect_retry_max)
                 log.warning(
-                    "Kalshi request error on %s: %s; retrying in %.1fs", path, exc, delay
+                    "Kalshi connection error on %s: %s; retrying in %.0fs "
+                    "(attempt %d/%d)",
+                    path, exc, wait, attempt + 1, self._max_retries,
                 )
-                await asyncio.sleep(delay)
+                await asyncio.sleep(wait)
                 delay = min(delay * 2, self._retry_max_delay)
 
         raise RuntimeError(f"Kalshi GET {path} exhausted retries")

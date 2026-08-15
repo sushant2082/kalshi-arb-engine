@@ -277,7 +277,10 @@ class CrossQuote:
                 self.kalshi_size.get(home, 0) if home_venue == "kalshi"
                 else self.poly_size.get(home, 0)
             )
+            # Whole contracts only: Kalshi does not trade fractions, so a
+            # combined depth under one contract is not executable at all.
             sets = int(min(a_size or 0, h_size or 0))
+            fillable = sets >= 1
 
             out.append({
                 "away_venue": away_venue,
@@ -290,9 +293,29 @@ class CrossQuote:
                 "sets": sets,
                 "dollar_profit": (1.0 - total) * sets,
                 "cross_venue": away_venue != home_venue,
+                "fillable": fillable,
             })
         return sorted(out, key=lambda c: c["total"])
 
     def best(self, fee_multiplier: float = 0.07) -> dict | None:
+        """
+        Cheapest EXECUTABLE combination.
+
+        Combinations with no depth behind them are excluded rather than ranked
+        first. A quoted price with zero size is not an offer, and treating it
+        as one produced most of the apparent opportunities in an early
+        measurement: 18 of 37 "crosses" had zero depth, and they carried both
+        the longest lifetimes and the most absurd margins (+87%). If nothing is
+        executable, the best non-fillable combo is returned so the prices are
+        still visible, but it is flagged and must not be counted as a cross.
+        """
         combos = self.combos(fee_multiplier)
-        return combos[0] if combos else None
+        if not combos:
+            return None
+        executable = [c for c in combos if c["fillable"]]
+        return executable[0] if executable else combos[0]
+
+    def best_fillable(self, fee_multiplier: float = 0.07) -> dict | None:
+        """The cheapest combination that could actually be traded, or None."""
+        best = self.best(fee_multiplier)
+        return best if best and best["fillable"] else None

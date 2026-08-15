@@ -190,7 +190,12 @@ def format_snapshot(quotes: list[CrossQuote], fee_multiplier: float = 0.07) -> s
             total = "  --  "
         else:
             total = f"{best['total']:.4f}"
-            if best["profit"] > 0:
+            if best["profit"] > 0 and not best.get("fillable"):
+                verdict = (
+                    f"price crosses +{best['profit'] * 100:.2f}% but NO DEPTH "
+                    "— not tradeable"
+                )
+            elif best["profit"] > 0:
                 venues = (
                     f"{best['away_venue'][:1].upper()}/{best['home_venue'][:1].upper()}"
                 )

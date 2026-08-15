@@ -80,7 +80,9 @@ async def record_read(conn: aiosqlite.Connection, cq, fee_multiplier: float) -> 
     minutes_in = (
         (now - p.start).total_seconds() / 60.0 if p.start else None
     )
-    is_cross = bool(best and best["profit"] > 0)
+    # A cross requires depth: a profitable price with nothing behind it is not
+    # a trade. Counting those inflated an early measurement by roughly half.
+    is_cross = bool(best and best["profit"] > 0 and best.get("fillable"))
 
     await conn.execute(
         """

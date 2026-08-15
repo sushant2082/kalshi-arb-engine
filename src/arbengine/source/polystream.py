@@ -77,12 +77,20 @@ class TokenBook:
         return self.asks.get(a, 0.0) if a is not None else 0.0
 
     def as_quote(self) -> dict:
-        """Same shape the REST path produces, so detectors cannot tell them apart."""
+        """
+        Same shape the REST path produces, so detectors cannot tell them apart.
+
+        Sizes stay FLOAT. Polymarket books carry fractional shares, and
+        int()-ing them silently turned a real 0.75-share quote into zero depth
+        — which then read as a tradeable cross with nothing behind it. Rounding
+        to whole contracts is the consumer's job, because only Kalshi requires
+        it.
+        """
         return {
             "bid": self.best_bid,
             "ask": self.best_ask,
-            "bid_size": int(self.bid_size),
-            "ask_size": int(self.ask_size),
+            "bid_size": self.bid_size,
+            "ask_size": self.ask_size,
         }
 
     def apply_snapshot(self, msg: dict) -> None:

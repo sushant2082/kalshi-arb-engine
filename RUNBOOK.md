@@ -56,6 +56,24 @@ file path is wrong.
 ## The main thing to run
 
 ```bash
+./scripts/fullday.sh
+```
+
+One command. Runs the event-driven recorder across a whole slate, then prints
+a plain-language report. Start it any time — it picks up games as they begin
+and waits quietly when none are live. Ctrl-C stops it cleanly and still
+reports.
+
+```bash
+./scripts/fullday.sh 8            # 8 hours instead of the default 10
+.venv/bin/python scripts/report.py  # re-read the results any time
+```
+
+Re-run `report.py` a day later to pick up positions that have since settled.
+
+### The alternative: polling with paper trading
+
+```bash
 .venv/bin/arbengine crossrec --duration 21600 --interval 12
 ```
 

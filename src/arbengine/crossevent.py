@@ -225,7 +225,12 @@ async def record_events(
                     stats["evaluations"] += 1
                     best = cq.best(fee_multiplier)
                     key = p.pm.condition_id
-                    crossing = bool(best and best["profit"] > 0)
+                    # Executable only. Zero-depth quotes produced 18 of 37
+                    # "crosses" in the first run, with the longest apparent
+                    # lifetimes and margins up to +87% — all untradeable.
+                    crossing = bool(
+                        best and best["profit"] > 0 and best.get("fillable")
+                    )
                     live = open_crosses.get(key)
 
                     if crossing and live is None:

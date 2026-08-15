@@ -133,3 +133,76 @@ def test_observe_tracks_the_peak_not_the_last_value() -> None:
     oc.observe({"profit": 0.01, "total": 0.99, "sets": 10, "dollar_profit": 0.1})
     assert oc.peak_profit == pytest.approx(0.05)
     assert oc.ticks == 3
+
+
+# ── Zero-depth quotes are not crosses ─────────────────────────────────────────
+
+def _quote(k_away, k_home, p_away, p_home, k_sz, p_sz):
+    from arbengine.crossmlb import CrossQuote, GamePair, PmGame
+
+    pm = PmGame(condition_id="0x", question="", slug="mlb-aaa-bbb-2026-08-15",
+                away_slug="AAA", home_slug="BBB", start=None,
+                outcome_names=["A", "B"], token_ids=["t1", "t2"])
+    pair = GamePair(away_slug="AAA", home_slug="BBB", start=None, pm=pm,
+                    kalshi_tickers={"AAA": "K-A", "BBB": "K-B"})
+    cq = CrossQuote(pair=pair)
+    cq.kalshi = {"AAA": k_away, "BBB": k_home}
+    cq.poly = {"AAA": p_away, "BBB": p_home}
+    cq.kalshi_size = {"AAA": k_sz, "BBB": k_sz}
+    cq.poly_size = {"AAA": p_sz, "BBB": p_sz}
+    return cq
+
+
+def test_zero_depth_price_cross_is_not_fillable() -> None:
+    """
+    The bug: 18 of 37 recorded "crosses" had zero depth. They had the longest
+    apparent lifetimes and the most absurd margins (+87%), because a stale
+    quote nothing is offered at does not move.
+    """
+    cq = _quote(0.40, 0.55, 0.42, 0.53, k_sz=0, p_sz=0)
+    best = cq.best(0.07)
+    assert best is not None, "prices still visible for analysis"
+    assert best["profit"] > 0
+    assert best["fillable"] is False
+    assert cq.best_fillable(0.07) is None, "nothing executable"
+
+
+def test_fractional_depth_under_one_contract_is_not_fillable() -> None:
+    """Kalshi trades whole contracts; 0.75 shares cannot be bought."""
+    cq = _quote(0.40, 0.55, 0.42, 0.53, k_sz=0.75, p_sz=0.75)
+    assert cq.best(0.07)["fillable"] is False
+
+
+def test_real_depth_is_fillable() -> None:
+    cq = _quote(0.40, 0.55, 0.42, 0.53, k_sz=500, p_sz=500)
+    best = cq.best_fillable(0.07)
+    assert best is not None
+    assert best["fillable"] is True
+    assert best["sets"] == 500
+    assert best["dollar_profit"] > 0
+
+
+def test_best_prefers_an_executable_combo_over_a_cheaper_phantom() -> None:
+    """
+    A zero-depth combination must never outrank a real one just by being
+    cheaper on paper — that is how an untradeable quote becomes the headline.
+    """
+    from arbengine.crossmlb import CrossQuote, GamePair, PmGame
+
+    pm = PmGame(condition_id="0x", question="", slug="mlb-aaa-bbb-2026-08-15",
+                away_slug="AAA", home_slug="BBB", start=None,
+                outcome_names=["A", "B"], token_ids=["t1", "t2"])
+    pair = GamePair(away_slug="AAA", home_slug="BBB", start=None, pm=pm,
+                    kalshi_tickers={"AAA": "K-A", "BBB": "K-B"})
+    cq = CrossQuote(pair=pair)
+    # Polymarket side is dirt cheap but has no depth; Kalshi side is real.
+    cq.kalshi = {"AAA": 0.45, "BBB": 0.52}
+    cq.poly = {"AAA": 0.10, "BBB": 0.52}
+    cq.kalshi_size = {"AAA": 900, "BBB": 900}
+    cq.poly_size = {"AAA": 0, "BBB": 900}
+
+    best = cq.best(0.07)
+    assert best["fillable"] is True
+    assert best["away_venue"] == "kalshi", (
+        "must not pick the phantom 0.10 quote with no depth behind it"
+    )

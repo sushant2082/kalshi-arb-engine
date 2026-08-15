@@ -27,7 +27,6 @@ Polymarket needs nothing at all — its market data is fully public.
 ```bash
 git clone git@github.com:sushant2082/kalshi-arb-engine.git
 cd kalshi-arb-engine
-git checkout testing
 
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
